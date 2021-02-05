@@ -3,11 +3,14 @@
 #include "address.h"
 #include "connection.h"
 #include "packet.h"
+#include "stream.h"
+#include "io_result.h"
 
 #include <chrono>
 #include <queue>
 #include <random>
 #include <unordered_map>
+#include <map>
 #include <vector>
 
 #include <uv.h>
@@ -21,23 +24,6 @@ namespace quic {
 using namespace std::literals;
 
 inline constexpr auto IDLE_TIMEOUT = 60s;
-
-// Return result from a read or write operation that wraps an error code value. It is implicitly
-// convertible to bool to test for "is not an error" (which is the inverse of casting a plain
-// integer error code value to bool).
-struct io_result {
-    // An error code; depending on the context this could be an errno value or an ngtcp2 error
-    // value.  Will be 0 for a successful operation.
-    int error_code{0};
-    // Returns true if this represent a successful result, i.e. an error_code of 0.
-    operator bool() const { return error_code == 0; }
-};
-
-// Stores an established stream (a single connection has multiple streams).
-struct Stream {
-    // FIXME: stream id?
-    std::function<void(std::string_view data)> callback;
-};
 
 class Endpoint {
 protected:
@@ -104,13 +90,6 @@ protected:
     // Connections that are draining (i.e. we are dropping, but need to keep around for a while
     // to catch and drop lagged packets).  The time point is the scheduled removal time.
     std::queue<std::pair<ConnectionID, std::chrono::steady_clock::time_point>> draining;
-
-    //
-    // the server is establishing
-    // can encode information
-    // Stores callbacks of active streams, indexed by our local source connection ID that we assign
-    // when the connection is initiated.
-    std::unordered_map<std::string, Stream> streams;
 
     friend class Connection;
 

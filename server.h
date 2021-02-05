@@ -2,8 +2,6 @@
 
 #include "endpoint.h"
 
-#include <stdexcept>
-
 namespace quic {
 
 class Server : public Endpoint {

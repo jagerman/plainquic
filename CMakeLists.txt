@@ -28,6 +28,7 @@ add_library(quictest
     connection.cpp
     endpoint.cpp
     server.cpp
+    stream.cpp
     )
 
 add_library(ngtcp2 STATIC IMPORTED GLOBAL)

@@ -2,6 +2,8 @@
 
 #include "address.h"
 #include "random.h"
+#include "stream.h"
+#include "io_result.h"
 
 #include <chrono>
 #include <cstddef>
@@ -9,6 +11,7 @@
 #include <memory>
 #include <string_view>
 #include <unordered_set>
+#include <map>
 
 #include <ngtcp2/ngtcp2.h>
 #include <uv.h>
@@ -38,7 +41,8 @@ struct alignas(size_t) ConnectionID : ngtcp2_cid {
     template <typename RNG>
     static ConnectionID random(RNG&& rng) {
         ConnectionID r;
-        random_bytes(r.data, r.max_size(), rng);
+        r.datalen = r.max_size();
+        random_bytes(r.data, r.datalen, rng);
         return r;
     }
 };
@@ -71,6 +75,7 @@ private:
     struct connection_deleter { void operator()(ngtcp2_conn* c) const { ngtcp2_conn_del(c); } };
     struct uv_async_deleter {
         void operator()(uv_async_t* a) const {
+            // FIXME: this is wrong; uv_close is asynchronous
             uv_close(reinterpret_cast<uv_handle_t*>(a), nullptr);
             delete a;
         }
@@ -80,12 +85,14 @@ private:
     Endpoint& endpoint;
 
     // Packet data storage for a packet we are currently sending
-    std::basic_string<std::byte> send_buffer{NGTCP2_MAX_PKTLEN_IPV4, std::byte{0}};
+    std::array<std::byte, NGTCP2_MAX_PKTLEN_IPV4> send_buffer{};
+    size_t send_buffer_size = 0;
 
     // Attempts to send the packet in `send_buffer`.  If sending blocks then we set up a write poll
-    // on the socket to wait for it to become available.  Returns true if we sent, false if an error
-    // occured (including, but not limited to, the case where we had to defer with the write poll).
-    bool send();
+    // on the socket to wait for it to become available, and return an io_result with `.blocked()`
+    // set to true.  On other I/O errors we return the errno, and on successful sending we return a
+    // "true" (i.e. no error code) io_result.
+    io_result send();
 
     // Poll for writability; activated if we block while trying to send a packet.
     uv_poll_t wpoll;
@@ -93,7 +100,7 @@ private:
 
     // Internal base method called invoked during construction to set up common client/server
     // settings.  dest_cid and path must already be set.
-    std::pair<ngtcp2_settings, ngtcp2_callbacks> init(Endpoint& ep);
+    std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> init(Endpoint& ep);
 
     // Event trigger used to queue packet processing for this connection
     std::unique_ptr<uv_async_t, uv_async_deleter> io_trigger;
@@ -117,16 +124,23 @@ public:
     /// Endpoint.conn_alias that point to our primary connection ID.
     std::unordered_set<ConnectionID> aliases;
 
+    // Stores callbacks of active streams, indexed by our local source connection ID that we assign
+    // when the connection is initiated.
+    std::map<int64_t, Stream> streams;
+
     /// Constructs and initializes a new connection received by a Server
     ///
-    /// \param endpoint - the Server object on which the connection was initiated
+    /// \param s - the Server object on which the connection was initiated
     /// \param scid - the source (i.e. local) ConnectionID for this connection, typically random
     /// \param header - packet header that initiated the connection
     /// \param path - the network path to reach the remote
     Connection(Server& s, const ConnectionID& scid, ngtcp2_pkt_hd& header, const Path& path);
 
     /// Establishes a connection from the local Client to a remote Server
-    Connection(Client& c, const Path& path);
+    /// \param c - the Client object from which the connection is being made
+    /// \param scid - the client's source connection ID, typically random
+    /// \param path - the network path to reach the remote
+    Connection(Client& c, const ConnectionID& scid, const Path& path);
 
     // Non-movable, non-copyable:
     Connection(Connection&&) = delete;
@@ -139,6 +153,10 @@ public:
 
     void io_callback();
     void on_read(bstring_view data);
+
+    // Flush any streams with pending data. Note that, depending on available ngtcp2 state, we may
+    // not fully flush all streams.
+    void flush_streams();
 };
 
 }

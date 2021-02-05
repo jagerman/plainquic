@@ -3,6 +3,9 @@
 
 #include <oxenmq/hex.h>
 
+#include <stdexcept>
+#include <tuple>
+
 namespace quic {
 
 Server::Server(Address listen, uv_loop_t* loop) : Endpoint{std::move(listen), loop} {
@@ -10,8 +13,9 @@ Server::Server(Address listen, uv_loop_t* loop) : Endpoint{std::move(listen), lo
 
 void Server::handle_packet(const Packet& p) {
     version_info vi;
+    Debug("Handling incoming server packet: ", make_printable(p.data));
     auto rv = ngtcp2_pkt_decode_version_cid(&vi.version, &vi.dcid, &vi.dcid_len, &vi.scid, &vi.scid_len,
-            reinterpret_cast<const uint8_t*>(p.data.data()), p.data.size(), NGTCP2_MAX_CIDLEN);
+            u8data(p.data), p.data.size(), NGTCP2_MAX_CIDLEN);
     if (rv == 1) // 1 means Version Negotiation should be sent
         return send_version_negotiation(vi, p.path.remote);
     else if (rv != 0) {
@@ -26,19 +30,23 @@ void Server::handle_packet(const Packet& p) {
 
     // See if we have an existing connection already established for it
     ConnectionID dcid{vi.dcid, vi.dcid_len};
+    Debug("Incoming connection id ", dcid);
     auto conn_it = conns.find(dcid);
     if (conn_it == conns.end()) {
         // Look for a cid alias
-        if (auto alias_it = conn_alias.find(dcid); alias_it != conn_alias.end())
+        if (auto alias_it = conn_alias.find(dcid); alias_it != conn_alias.end()) {
+            Debug("Found cid alias: ", dcid, " -> ", alias_it->second);
             conn_it = conns.find(alias_it->second);
-        else
+        } else {
             // FIXME: what if this is a client?  Drop it?
             conn_it = accept_connection(p);
+        }
 
-        if (conn_it == conns.end())
+        if (conn_it == conns.end()) {
+            Warn(); // FIXME
             return;
+        }
 
-        auto& [local_cid, conn] = *conn_it;
     }
     // FIXME: there are also connection ID aliases we need to worry about
 
@@ -47,12 +55,15 @@ void Server::handle_packet(const Packet& p) {
         return;
     }
 
-    if (ngtcp2_conn_is_in_closing_period(conn_it->second)) {
+    auto& [cid, conn] = *conn_it;
+
+    if (ngtcp2_conn_is_in_closing_period(conn)) {
+        Debug("Connection is in closing period, dropping");
         close_connection(std::move(conn_it));
         return;
     }
-    auto& [cid, conn] = *conn_it;
     if (conn.draining) {
+        Debug("Connection is draining, dropping");
         // "draining" state means we received a connection close and we're keeping the
         // connection alive just to catch (and discard) straggling packets that arrive
         // out of order w.r.t to connection close.
@@ -62,14 +73,17 @@ void Server::handle_packet(const Packet& p) {
     auto result = read_packet(p, conn_it);
 
     if (!result) {
+        Debug("Read packet failed! ", ngtcp2_strerror(result.error_code));
     }
     // FIXME - reset idle timer?
+    Debug("Done with incoming packet");
 }
 
 auto Server::accept_connection(const Packet& p) -> conns_iterator {
+    Debug("Accepting new connection");
     // This is a new incoming connection
     ngtcp2_pkt_hd hd;
-    auto rv = ngtcp2_accept(&hd, reinterpret_cast<const uint8_t*>(p.data.data()), p.data.size());
+    auto rv = ngtcp2_accept(&hd, u8data(p.data), p.data.size());
 
     if (rv == -1) { // Invalid packet
         Warn("Invalid packet received, length=", p.data.size());
@@ -96,22 +110,22 @@ auto Server::accept_connection(const Packet& p) -> conns_iterator {
     if (hd.type == NGTCP2_PKT_0RTT) {
         Warn("Received 0-RTT packet, which shouldn't happen in our implementation; dropping");
         return conns.end();
+    } else if (hd.type == NGTCP2_PKT_INITIAL && hd.token.len) {
+        // This is a normal QUIC thing, but we don't do it:
+        Warn("Unexpected token in initial packet");
     }
 
     // create and store Connection
     ConnectionID local_cid;
-    local_cid.datalen = local_cid.max_size();
-    do {
-        random_bytes(local_cid.data, local_cid.max_size(), rng);
-    } while (conns.count(local_cid));
+    do { local_cid = ConnectionID::random(rng); } while (conns.count(local_cid));
+
+    Debug("Created local cid ", local_cid, " for incoming connection");
 
     conns_iterator it = conns.end();
     try {
-        auto* s = dynamic_cast<Server*>(this);
-        assert(s);
         auto [insit, ins] = conns.emplace(std::piecewise_construct,
                 std::forward_as_tuple(local_cid),
-                std::forward_as_tuple(*s, local_cid, hd, p.path));
+                std::forward_as_tuple(*this, local_cid, hd, p.path));
         if (!ins)
             Warn("Internal error: duplicate connection id?");
         else

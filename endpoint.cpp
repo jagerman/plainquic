@@ -8,9 +8,15 @@
 
 #include "log.h"
 
+// DEBUG:
+extern "C" {
+#include "../ngtcp2_conn.h"
+}
+
 namespace quic {
 
-Endpoint::Endpoint(std::optional<Address> addr, uv_loop_t* loop) {
+Endpoint::Endpoint(std::optional<Address> addr, uv_loop_t* loop_)
+        : loop{loop_} {
     // Create and bind the UDP socket. We can't use libuv's UDP socket here because it doesn't
     // give us the ability to set up the ECN field as QUIC requires.
     auto fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
@@ -123,9 +129,11 @@ void Endpoint::poll_callback(int status, int events) {
             }
         }
 
-        Debug(i, '[', pkt.path, ",ecn=0x", std::hex, pkt.info.ecn, std::dec, "]: received ", msg_len, " bytes");
+        Debug(i, '[', pkt.path, ",ecn=0x", std::hex, +pkt.info.ecn, std::dec, "]: received ", msg_len, " bytes");
 
         handle_packet(pkt);
+
+        Debug("Done handling packet");
 
 #ifdef LOKINET_HAVE_RECVMMSG // Help editor's { } matching:
     }
@@ -135,23 +143,20 @@ void Endpoint::poll_callback(int status, int events) {
 }
 
 io_result Endpoint::read_packet(const Packet& p, conns_iterator conn_it) {
+    Debug("Reading packet from ", p.path);
     auto& [cid, conn] = *conn_it;
     auto rv = ngtcp2_conn_read_pkt(conn, p.path, &p.info,
-            reinterpret_cast<const uint8_t*>(p.data.data()), p.data.size(),
+            u8data(p.data), p.data.size(),
             get_timestamp());
 
-    switch (rv) {
-        case NGTCP2_ERR_DRAINING:
-            start_draining(conn_it);
-            return {rv};
-        case NGTCP2_ERR_DROP_CONN:
-            delete_conn(std::move(conn_it));
-            return {rv};
-        case 0:
-        case NGTCP2_ERR_RETRY:
-            return {rv};
-    };
-    close_connection(std::move(conn_it), ngtcp2_err_infer_quic_transport_error_code(rv));
+    if (rv != 0)
+        Warn("read pkt error: ", ngtcp2_strerror(rv));
+
+    if (rv == NGTCP2_ERR_DRAINING)
+        start_draining(conn_it);
+    else if (rv == NGTCP2_ERR_DROP_CONN)
+        delete_conn(std::move(conn_it));
+
     return {rv};
 }
 
@@ -192,7 +197,7 @@ io_result Endpoint::send_packet(const Address& to, bstring_view data) {
         return {errno};
     }
 
-    Debug("[", to.to_string(), ",ecn=0x", std::hex, ecn_curr, std::dec,
+    Debug("[", to.to_string(), ",ecn=0x", std::hex, +ecn_curr, std::dec,
         "]: sent ", nwrite, " bytes");
     return {};
 }
@@ -205,7 +210,7 @@ void Endpoint::send_version_negotiation(const version_info& vi, const Address& s
     versions[0] = 0x1a2a3a4au;
 
     auto nwrote = ngtcp2_pkt_write_version_negotiation(
-            reinterpret_cast<uint8_t*>(buf.data()), buf.size(),
+            u8data(buf), buf.size(),
             std::uniform_int_distribution<uint8_t>{0, 255}(rng),
             vi.dcid, vi.dcid_len, vi.scid, vi.scid_len, versions.data(), versions.size());
     if (nwrote < 0)
@@ -232,8 +237,7 @@ void Endpoint::close_connection(conns_iterator cit, uint64_t code, bool applicat
                 c,
                 path,
                 &pi,
-                reinterpret_cast<unsigned char*>(c.closing.data()),
-                c.closing.size(),
+                u8data(c.closing), c.closing.size(),
                 code,
                 get_timestamp());
         if (written < 0) {
@@ -296,16 +300,5 @@ auto Endpoint::delete_conn(conns_iterator cit) -> conns_iterator {
         conn_alias.erase(alias_cid);
     return conns.erase(cit);
 }
-
-/*
-static void alloc_buffer(uv_handle_t* h, size_t suggested_size, uv_buf_t* buf) {
-    auto& self = *static_cast<Server*>(h->data);
-    if (self.buffer.size() < suggested_size)
-        self.buffer.resize(suggested_size);
-    buf->base = self.buffer.data();
-    buf->len = self.buffer.size();
-}
-*/
-
 
 }

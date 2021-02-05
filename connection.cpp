@@ -10,6 +10,11 @@
 
 #include <oxenmq/hex.h>
 
+// DEBUG
+extern "C" {
+#include "../ngtcp2_conn.h"
+}
+
 
 namespace quic {
 
@@ -28,6 +33,23 @@ namespace {
 #pragma GCC diagnostic ignored "-Wunused-parameter"
     int client_initial(ngtcp2_conn* conn, void* user_data) {
         Debug();
+
+        ngtcp2_transport_params_type exttype = ngtcp2_conn_is_server(conn)
+            ? NGTCP2_TRANSPORT_PARAMS_TYPE_ENCRYPTED_EXTENSIONS
+            : NGTCP2_TRANSPORT_PARAMS_TYPE_CLIENT_HELLO;
+
+        ngtcp2_transport_params tparams;
+        ngtcp2_conn_get_local_transport_params(conn, &tparams);
+
+        std::array<uint8_t, 256> buf;
+        ngtcp2_ssize nwrite = ngtcp2_encode_transport_params(buf.data(), buf.size(), exttype, &tparams);
+        if (nwrite < 0)
+            return nwrite;
+        Debug("encoded transport params: ", make_printable(buf.data(), buf.data() + nwrite));
+        ngtcp2_conn_submit_crypto_data(conn, NGTCP2_CRYPTO_LEVEL_INITIAL, buf.data(), nwrite);
+
+        // FIXME: perhaps the crypto ctx init stuff should be here?
+        ngtcp2_conn_handshake_completed(conn);
         // FIXME
         return 0;
     }
@@ -176,31 +198,40 @@ extern "C" inline void debug_logger([[maybe_unused]] void* user_data, const char
 #endif
 
 
-bool Connection::send() {
-    if (!send_buffer.empty()) {
-        auto rv = endpoint.send_packet(path.remote, send_buffer);
-        if (rv.error_code == EAGAIN || rv.error_code == EWOULDBLOCK) {
+io_result Connection::send() {
+    assert(send_buffer_size <= send_buffer.size());
+    io_result rv{};
+    bstring_view send_data{send_buffer.data(), send_buffer_size};
+    if (!send_data.empty()) {
+        Debug("Sending packet: ", make_printable(send_data));
+        rv = endpoint.send_packet(path.remote, send_data);
+        if (rv.blocked()) {
             uv_poll_start(&wpoll, UV_WRITABLE,
                     [](uv_poll_t* handle, int status, int events) {
                         static_cast<Connection*>(handle->data)->send();
                     });
             wpoll_active = true;
-            return false;
         } else if (!rv) {
-            // FIXME: disconnect here
-            return false;
+            // FIXME: disconnect here?
+            Warn("packet send failed: ", rv.str());
         }
     }
+    return rv;
 
     // We succeeded
+    //
+    // FIXME2: probably don't want to do these things *here*, because this is called from the stream
+    // checking code.
+    //
     // FIXME: check and send other pending streams
     //
     // FIXME: schedule retransmit?
-    return true;
+    //return true;
 }
 
 
-std::pair<ngtcp2_settings, ngtcp2_callbacks> Connection::init(Endpoint& ep) {
+std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connection::init(Endpoint& ep) {
+    Debug("loop: ", ep.loop);
     io_trigger.reset(new uv_async_t);
     io_trigger->data = this;
     uv_async_init(ep.loop, io_trigger.get(),
@@ -210,8 +241,8 @@ std::pair<ngtcp2_settings, ngtcp2_callbacks> Connection::init(Endpoint& ep) {
     uv_poll_init(ep.loop, &wpoll, ep.socket_fd());
     // Don't start wpoll now; we only start it up temporarily when a send blocks.
 
-    auto result = std::pair<ngtcp2_settings, ngtcp2_callbacks>{};
-    auto& [settings, cb] = result;
+    auto result = std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks>{};
+    auto& [settings, tparams, cb] = result;
     cb.recv_crypto_data = recv_crypto_data;
     cb.encrypt = encrypt;
     cb.decrypt = decrypt;
@@ -235,7 +266,8 @@ std::pair<ngtcp2_settings, ngtcp2_callbacks> Connection::init(Endpoint& ep) {
     settings.cc_algo = NGTCP2_CC_ALGO_CUBIC;
     //settings.initial_rtt = ???; # NGTCP2's default is 333ms
 
-    auto& tparams = settings.transport_params;
+    ngtcp2_transport_params_default(&tparams);
+
     // Max send buffer for a stream we initiate:
     tparams.initial_max_stream_data_bidi_local = 64*1024;
     // Max send buffer for a stream the remote initiated:
@@ -255,34 +287,36 @@ std::pair<ngtcp2_settings, ngtcp2_callbacks> Connection::init(Endpoint& ep) {
 Connection::Connection(Server& s, const ConnectionID& scid, ngtcp2_pkt_hd& header, const Path& path)
         : endpoint{s}, dest_cid{header.scid.data, header.scid.datalen}, path{path} {
 
-    auto [settings, cb] = init(s);
+    auto [settings, tparams, cb] = init(s);
 
     cb.recv_client_initial = recv_client_initial;
     cb.stream_open = stream_open;
 
-    auto& tparams = settings.transport_params;
+    Debug("header.type = ", +header.type);
+
     tparams.original_dcid = scid;
     settings.token = header.token;
+    // FIXME is this required?
     random_bytes(std::begin(tparams.stateless_reset_token), sizeof(tparams.stateless_reset_token), s.rng);
     tparams.stateless_reset_token_present = 1;
 
     ngtcp2_conn* connptr;
+    Debug("server_new, path=", path);
     if (auto rv = ngtcp2_conn_server_new(&connptr, &dest_cid, &scid, path, header.version,
-                &cb, &settings, nullptr /*default mem allocator*/, this);
+                &cb, &settings, &tparams, nullptr /*default mem allocator*/, this);
             rv != 0)
         throw std::runtime_error{
             "Failed to initialize server connection: "s + ngtcp2_strerror(rv)};
     conn.reset(connptr);
 
     Debug("Created new server conn ", scid);
-    
 }
 
 
-Connection::Connection(Client& c, const Path& path)
+Connection::Connection(Client& c, const ConnectionID& scid, const Path& path)
         : endpoint{c}, dest_cid{ConnectionID::random(c.rng)}, path{path} {
 
-    auto [settings, cb] = init(c);
+    auto [settings, tparams, cb] = init(c);
 
     cb.client_initial = client_initial;
     cb.recv_retry = recv_retry;
@@ -293,10 +327,9 @@ Connection::Connection(Client& c, const Path& path)
     ngtcp2_conn* connptr;
     constexpr uint32_t version = 0xff000020u;
     static_assert(version >= NGTCP2_PROTO_VER_MIN && version <= NGTCP2_PROTO_VER_MAX);
-    auto scid = ConnectionID::random(c.rng);
 
     if (auto rv = ngtcp2_conn_client_new(&connptr, &dest_cid, &scid, path, version,
-                &cb, &settings, nullptr, this);
+                &cb, &settings, &tparams, nullptr, this);
             rv != 0)
         throw std::runtime_error{
             "Failed to initialize client connection: "s + ngtcp2_strerror(rv)};
@@ -314,6 +347,111 @@ void Connection::io_callback() {
 void Connection::on_read(bstring_view data) {
     Debug("data size: ", data.size());
     // FIXME
+}
+
+void Connection::flush_streams() {
+    // conn, path, pi, dest, destlen, and ts
+    ngtcp2_pkt_info pi;
+    std::optional<uint64_t> ts;
+
+    auto add_stream_data = [&](int64_t stream_id, const ngtcp2_vec* datav, size_t datalen) {
+        std::array<ngtcp2_ssize, 2> result;
+        auto& [nwrite, consumed] = result;
+        if (!ts) ts = get_timestamp();
+
+        nwrite = ngtcp2_conn_writev_stream(
+                conn.get(), &path.path, &pi,
+                u8data(send_buffer),
+                send_buffer.size(),
+                &consumed,
+                NGTCP2_WRITE_STREAM_FLAG_MORE,
+                stream_id,
+                datav, datalen,
+                *ts);
+        return result;
+    };
+
+    auto send_packet = [&](auto nwrite) -> bool {
+        send_buffer_size = nwrite;
+        Debug("Sending ", send_buffer_size, "B packet");
+
+        // FIXME: update remote addr? ecn?
+        auto sent = send();
+        if (sent.blocked()) {
+            // FIXME: somewhere (maybe here?) should be setting up a write poll so that, once
+            // writing becomes available again (and the pending packet gets sent), we get back here.
+            // FIXME 2: I think this is already done by send() itself.
+            return false;
+        }
+        send_buffer_size = 0;
+        if (!sent) {
+            Warn("I/O error while trying to send packet: ", sent.str());
+            // FIXME: disconnect?
+            return false;
+        }
+        Debug("packet away!");
+        return true;
+    };
+
+    for (auto& [stream_id, stream] : streams) {
+        auto bufs = stream.pending();
+        if (!bufs[0]) continue;
+        std::array<ngtcp2_vec, 2> vecs;
+        vecs[0].base = const_cast<uint8_t*>(u8data(*bufs[0]));
+        vecs[0].len = bufs[0]->length();
+        if (bufs[1]) {
+            vecs[1].base = const_cast<uint8_t*>(u8data(*bufs[1]));
+            vecs[1].len = bufs[1]->length();
+        }
+
+        auto [nwrite, consumed] = add_stream_data(stream_id, vecs.data(), bufs[1] ? 2 : 1);
+
+        if (nwrite == NGTCP2_ERR_WRITE_MORE) {
+            Debug("consumed ", consumed, " bytes from stream ", stream_id, " and have space left");
+            stream.wrote(consumed);
+            continue;
+        } else if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+            Debug("cannot add to stream ", stream_id, " right now: stream is blocked");
+            continue;
+        } else if (nwrite < 0) {
+            assert(consumed <= 0);
+            Warn("Error writing to stream ", stream_id, ": ", ngtcp2_strerror(nwrite));
+            return;
+        } else if (nwrite == 0) {
+            // FIXME: 
+            Debug("Unable to continue stream writing: we are congested");
+            return;
+        }
+
+        if (consumed >= 0) {
+            Debug("consumed ", consumed, " bytes from stream ", stream_id);
+            stream.wrote(consumed);
+        }
+
+        if (!send_packet(nwrite))
+            return;
+    }
+
+    // Now try more with stream id -1 and no data: this will take care of initial handshake packets,
+    // and should finish off any partially-filled packet from above.
+    for (;;) {
+        auto [nwrite, consumed] = add_stream_data(-1, nullptr, 0);
+        assert(consumed <= 0);
+        if (nwrite == NGTCP2_ERR_WRITE_MORE) {
+            Debug("Writing non-stream data, and have space left");
+            continue;
+        } else if (nwrite < 0) {
+            Warn("Error writing non-stream data: ", ngtcp2_strerror(nwrite));
+            return;
+        } else if (nwrite == 0) {
+            // FIXME: Check whether this is actually possible for the -1 streamid?
+            Warn("Unable to continue non-stream writing: we are congested");
+            return;
+        }
+
+        if (!send_packet(nwrite))
+            return;
+    }
 }
 
 }

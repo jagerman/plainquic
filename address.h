@@ -50,20 +50,26 @@ public:
 // Implicitly convertable to a ngtcp2_path* so that this can be passed wherever a ngtcp2_path* is
 // taken in the ngtcp2 API.
 struct Path {
-    Address local{}, remote{};
+private:
+    Address local_{}, remote_{};
+public:
     ngtcp2_path path{
-        {0, local, nullptr},
-        {0, remote, nullptr}};
+        {local_.sockaddr_size(), local_, nullptr},
+        {remote_.sockaddr_size(), remote_, nullptr}};
+
+    // Public accessors are const:
+    const Address& local = local_;
+    const Address& remote = remote_;
 
     Path() = default;
-    Path(const Address& local, const Address& remote) : local{local}, remote{remote} {}
+    Path(const Address& local, const Address& remote) : local_{local}, remote_{remote} {}
     Path(const Address& local, const sockaddr_any* remote_addr, size_t remote_len)
-        : local{local}, remote{remote_addr, remote_len} {}
-    Path(const Path& p) : local{p.local}, remote{p.remote} {}
+        : local_{local}, remote_{remote_addr, remote_len} {}
+    Path(const Path& p) : local_{p.local_}, remote_{p.remote_} {}
 
     Path& operator=(const Path& p) {
-        local = p.local;
-        remote = p.remote;
+        local_ = p.local_;
+        remote_ = p.remote_;
         return *this;
     }
 
