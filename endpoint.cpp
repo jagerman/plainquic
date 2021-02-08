@@ -1,12 +1,15 @@
 #include "endpoint.h"
 #include "server.h"
 #include "client.h"
+#include "log.h"
 
 #include <iostream>
+#include <variant>
 
 #include <oxenmq/hex.h>
+#include <oxenmq/variant.h>
 
-#include "log.h"
+#include <sodium/crypto_generichash.h>
 
 // DEBUG:
 extern "C" {
@@ -17,6 +20,9 @@ namespace quic {
 
 Endpoint::Endpoint(std::optional<Address> addr, uv_loop_t* loop_)
         : loop{loop_} {
+
+    random_bytes(static_secret.data(), static_secret.size(), rng);
+
     // Create and bind the UDP socket. We can't use libuv's UDP socket here because it doesn't
     // give us the ability to set up the ECN field as QUIC requires.
     auto fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
@@ -110,7 +116,7 @@ void Endpoint::poll_callback(int status, int events) {
         bstring_view data{buf.data(), msg_len};
 #endif
 
-        Debug("header [", msg_hdr.msg_namelen, "]: ", oxenmq::to_hex(std::string_view{reinterpret_cast<char*>(msg_hdr.msg_name), msg_hdr.msg_namelen}));
+        Debug("header [", msg_hdr.msg_namelen, "]: ", buffer_printer{reinterpret_cast<char*>(msg_hdr.msg_name), msg_hdr.msg_namelen});
 
         if (!msg_hdr.msg_name || msg_hdr.msg_namelen != sizeof(sockaddr_in)) { // FIXME: IPv6 support?
             Warn("Invalid/unknown source address, dropping packet");
@@ -129,7 +135,7 @@ void Endpoint::poll_callback(int status, int events) {
             }
         }
 
-        Debug(i, '[', pkt.path, ",ecn=0x", std::hex, +pkt.info.ecn, std::dec, "]: received ", msg_len, " bytes");
+        Debug(i, "[", pkt.path, ",ecn=0x", std::hex, +pkt.info.ecn, std::dec, "]: received ", msg_len, " bytes");
 
         handle_packet(pkt);
 
@@ -142,20 +148,62 @@ void Endpoint::poll_callback(int status, int events) {
 #endif
 }
 
-io_result Endpoint::read_packet(const Packet& p, conns_iterator conn_it) {
+std::optional<ConnectionID> Endpoint::handle_packet_init(const Packet& p) {
+    version_info vi;
+    auto rv = ngtcp2_pkt_decode_version_cid(&vi.version, &vi.dcid, &vi.dcid_len, &vi.scid, &vi.scid_len,
+            u8data(p.data), p.data.size(), NGTCP2_MAX_CIDLEN);
+    if (rv == 1) { // 1 means Version Negotiation should be sent and otherwise the packet should be ignored
+        send_version_negotiation(vi, p.path.remote);
+        return std::nullopt;
+    } else if (rv != 0) {
+        Warn("QUIC packet header decode failed: ", ngtcp2_strerror(rv));
+        return std::nullopt;
+    }
+
+    if (vi.dcid_len > ConnectionID::max_size()) {
+        Warn("Internal error: destination ID is longer than should be allowed");
+        return std::nullopt;
+    }
+
+    return std::make_optional<ConnectionID>(vi.dcid, vi.dcid_len);
+}
+void Endpoint::handle_conn_packet(Connection& conn, const Packet& p) {
+    if (ngtcp2_conn_is_in_closing_period(conn)) {
+        Debug("Connection is in closing period, dropping");
+        close_connection(conn);
+        return;
+    }
+    if (conn.draining) {
+        Debug("Connection is draining, dropping");
+        // "draining" state means we received a connection close and we're keeping the
+        // connection alive just to catch (and discard) straggling packets that arrive
+        // out of order w.r.t to connection close.
+        return;
+    }
+
+    if (auto result = read_packet(p, conn); !result) {
+        Warn("Read packet failed! ", ngtcp2_strerror(result.error_code));
+    }
+
+    // FIXME - reset idle timer?
+    Debug("Done with incoming packet");
+}
+
+io_result Endpoint::read_packet(const Packet& p, Connection& conn) {
     Debug("Reading packet from ", p.path);
-    auto& [cid, conn] = *conn_it;
+    Debug("Conn state before reading: ", conn.conn->state);
     auto rv = ngtcp2_conn_read_pkt(conn, p.path, &p.info,
             u8data(p.data), p.data.size(),
             get_timestamp());
+    Debug("Conn state after reading: ", conn.conn->state);
 
     if (rv != 0)
         Warn("read pkt error: ", ngtcp2_strerror(rv));
 
     if (rv == NGTCP2_ERR_DRAINING)
-        start_draining(conn_it);
+        start_draining(conn);
     else if (rv == NGTCP2_ERR_DROP_CONN)
-        delete_conn(std::move(conn_it));
+        delete_conn(conn.base_cid);
 
     return {rv};
 }
@@ -222,45 +270,38 @@ void Endpoint::send_version_negotiation(const version_info& vi, const Address& s
     send_packet(source, bstring_view{buf.data(), static_cast<size_t>(nwrote)});
 }
 
-void Endpoint::close_connection(conns_iterator cit, uint64_t code, bool application) {
-    Debug("Closing connection ", cit->first);
-    auto& [cid, c] = *cit;
-    if (c.closing.empty()) {
-        c.closing.resize(max_pkt_size_v4);
+void Endpoint::close_connection(Connection& conn, uint64_t code, bool application) {
+    Debug("Closing connection ", conn.base_cid);
+    if (!conn.closing) {
+        conn.conn_buffer.resize(max_pkt_size_v4);
         Path path;
         ngtcp2_pkt_info pi;
 
         auto write_close_func = application
             ? ngtcp2_conn_write_application_close
             : ngtcp2_conn_write_connection_close;
-        auto written = write_close_func(
-                c,
-                path,
-                &pi,
-                u8data(c.closing), c.closing.size(),
-                code,
-                get_timestamp());
-        if (written < 0) {
-            c.closing.clear();
-            Warn("Failed to write connection close packet: ", ngtcp2_strerror(written));
+        auto written = write_close_func(conn, path, &pi, u8data(conn.conn_buffer), conn.conn_buffer.size(), code, get_timestamp());
+        if (written <= 0) {
+            Warn("Failed to write connection close packet: ", written < 0 ? ngtcp2_strerror(written) : "unknown error: closing is 0 bytes??");
             return;
         }
-        assert(written <= (long) c.closing.size());
-        c.closing.resize(written);
+        assert(written <= (long) conn.conn_buffer.size());
+        conn.conn_buffer.resize(written);
+        conn.closing = true;
 
         // FIXME: ipv6
         assert(path.local.sockaddr_size() == sizeof(sockaddr_in));
         assert(path.remote.sockaddr_size() == sizeof(sockaddr_in));
 
-        c.path = path;
+        conn.path = path;
     }
-    assert(!c.closing.empty());
+    assert(conn.closing && !conn.conn_buffer.empty());
 
     ecn_next = 0;
-    if (auto sent = send_packet(c.path.remote, c.closing);
+    if (auto sent = send_packet(conn.path.remote, conn.conn_buffer);
             !sent) {
-        Warn("Failed to send packet: ", strerror(sent.error_code), "; removing connection ", cid);
-        delete_conn(cit);
+        Warn("Failed to send packet: ", strerror(sent.error_code), "; removing connection ", conn.base_cid);
+        delete_conn(conn.base_cid);
         return;
     }
 }
@@ -268,37 +309,96 @@ void Endpoint::close_connection(conns_iterator cit, uint64_t code, bool applicat
 /// Puts a connection into draining mode (i.e. after getting a connection close).  This will
 /// keep the connection registered for the recommended 3*Probe Timeout, during which we drop
 /// packets that use the connection id and after which we will forget about it.
-void Endpoint::start_draining(const conns_iterator& cit) {
-    auto& [cid, conn] = *cit;
+void Endpoint::start_draining(Connection& conn) {
     if (conn.draining)
         return;
+    Debug("Putting ", conn.base_cid, " into draining mode");
     conn.draining = true;
     // Recommended draining time is 3*Probe Timeout
-    draining.emplace(cid, now() + ngtcp2_conn_get_pto(conn) * 3 * 1ns);
+    draining.emplace(conn.base_cid, now() + ngtcp2_conn_get_pto(conn) * 3 * 1ns);
 }
 
 void Endpoint::check_timeouts() {
     auto expired = now();
-    // Destroy any connections that are finished draining
-    while (!draining.empty() && draining.front().second < expired) {
-        if (auto it = conns.find(draining.front().first); it != conns.end())
-            delete_conn(std::move(it));
-        draining.pop();
-    }
-
     uint64_t expired_ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
             expired.time_since_epoch()).count();
+
+    // Destroy any connections that are finished draining
+    bool cleanup = false;
+    while (!draining.empty() && draining.front().second < expired) {
+        if (auto it = conns.find(draining.front().first); it != conns.end()) {
+            if (std::holds_alternative<primary_conn_ptr>(it->second))
+                cleanup = true;
+            Debug("Deleting connection ", it->first);
+            conns.erase(it);
+        }
+        draining.pop();
+    }
+    if (cleanup)
+        clean_alias_conns();
+
     for (auto it = conns.begin(); it != conns.end(); ++it) {
-        if (ngtcp2_conn_get_idle_expiry(it->second) >= expired_ts)
-            continue;
-        start_draining(it);
+        if (auto *conn_ptr = std::get_if<primary_conn_ptr>(&it->second)) {
+            Connection& conn = **conn_ptr;
+            auto exp = ngtcp2_conn_get_idle_expiry(conn);
+            if (exp >= expired_ts || conn.draining)
+                continue;
+            start_draining(conn);
+        }
     }
 }
 
-auto Endpoint::delete_conn(conns_iterator cit) -> conns_iterator {
-    for (auto& alias_cid : cit->second.aliases)
-        conn_alias.erase(alias_cid);
-    return conns.erase(cit);
+std::pair<std::shared_ptr<Connection>, bool> Endpoint::get_conn(const ConnectionID& cid) {
+    if (auto it = conns.find(cid); it != conns.end()) {
+        if (auto *wptr = std::get_if<alias_conn_ptr>(&it->second))
+            return {wptr->lock(), true};
+        return {var::get<primary_conn_ptr>(it->second), false};
+    }
+    return {nullptr, false};
 }
+
+bool Endpoint::delete_conn(const ConnectionID& cid) {
+    auto it = conns.find(cid);
+    if (it == conns.end()) {
+        Debug("Cannot delete connection ", cid, ": cid not found");
+        return false;
+    }
+
+    bool primary = std::holds_alternative<primary_conn_ptr>(it->second);
+    Debug("Deleting ", primary ? "primary" : "alias", " connection ", cid);
+    conns.erase(it);
+    if (primary)
+        clean_alias_conns();
+    return true;
+}
+
+void Endpoint::clean_alias_conns() {
+    for (auto it = conns.begin(); it != conns.end(); ) {
+        if (auto *conn_wptr = std::get_if<alias_conn_ptr>(&it->second);
+                conn_wptr && conn_wptr->expired())
+            it = conns.erase(it);
+        else
+            ++it;
+    }
+}
+
+ConnectionID Endpoint::add_connection_id(Connection& conn, size_t cid_length) {
+    ConnectionID cid;
+    for (bool inserted = false; !inserted; ) {
+        cid = ConnectionID::random(rng, cid_length);
+        inserted = conns.emplace(cid, conn.weak_from_this()).second;
+    }
+    Debug("Created cid ", cid, " alias for ", conn.base_cid);
+    return cid;
+}
+
+void Endpoint::make_stateless_reset_token(const ConnectionID& cid, unsigned char* dest) {
+    crypto_generichash_state state;
+    crypto_generichash_init(&state, nullptr, 0, NGTCP2_STATELESS_RESET_TOKENLEN);
+    crypto_generichash_update(&state, u8data(static_secret), static_secret.size());
+    crypto_generichash_update(&state, cid.data, cid.datalen);
+    crypto_generichash_final(&state, dest, NGTCP2_STATELESS_RESET_TOKENLEN);
+}
+
 
 }

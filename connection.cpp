@@ -29,38 +29,109 @@ std::ostream& operator<<(std::ostream& o, const ConnectionID& c) {
 }
 
 namespace {
+
+int recv_transport_params(Connection& c, std::basic_string_view<uint8_t> data) {
+    ngtcp2_transport_params params;
+
+    auto exttype = ngtcp2_conn_is_server(c)
+        ? NGTCP2_TRANSPORT_PARAMS_TYPE_CLIENT_HELLO
+        : NGTCP2_TRANSPORT_PARAMS_TYPE_ENCRYPTED_EXTENSIONS;
+
+    auto rv = ngtcp2_decode_transport_params(&params, exttype, data.data(), data.size());
+    Debug("Decode transport params ", rv == 0 ? "success" : "fail: "s + ngtcp2_strerror(rv));
+    if (rv == 0) {
+        rv = ngtcp2_conn_set_remote_transport_params(c, &params);
+        Debug("Set remote transport params ", rv == 0 ? "success" : "fail: "s + ngtcp2_strerror(rv));
+    }
+
+    if (rv != 0)
+        ngtcp2_conn_set_tls_error(c, rv);
+    return rv;
+}
+
+int send_transport_params(Connection& c) {
+    ngtcp2_transport_params tparams;
+    ngtcp2_conn_get_local_transport_params(c, &tparams);
+
+    assert(c.conn_buffer.empty());
+    static_assert(NGTCP2_MAX_PKTLEN_IPV4 > NGTCP2_MAX_PKTLEN_IPV6);
+    c.conn_buffer.resize(NGTCP2_MAX_PKTLEN_IPV4);
+
+    auto exttype = ngtcp2_conn_is_server(c)
+        ? NGTCP2_TRANSPORT_PARAMS_TYPE_ENCRYPTED_EXTENSIONS
+        : NGTCP2_TRANSPORT_PARAMS_TYPE_CLIENT_HELLO;
+
+    if (ngtcp2_ssize nwrite = ngtcp2_encode_transport_params(u8data(c.conn_buffer), c.conn_buffer.size(), exttype, &tparams);
+            nwrite >= 0)
+        c.conn_buffer.resize(nwrite);
+    else
+        return nwrite;
+    Debug("encoded transport params: ", buffer_printer{c.conn_buffer});
+    ngtcp2_conn_submit_crypto_data(c, NGTCP2_CRYPTO_LEVEL_INITIAL, u8data(c.conn_buffer), c.conn_buffer.size());
+
+    return 0;
+}
+
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
-    int client_initial(ngtcp2_conn* conn, void* user_data) {
-        Debug();
 
-        ngtcp2_transport_params_type exttype = ngtcp2_conn_is_server(conn)
-            ? NGTCP2_TRANSPORT_PARAMS_TYPE_ENCRYPTED_EXTENSIONS
-            : NGTCP2_TRANSPORT_PARAMS_TYPE_CLIENT_HELLO;
+    constexpr int FAIL = NGTCP2_ERR_CALLBACK_FAILURE;
 
-        ngtcp2_transport_params tparams;
-        ngtcp2_conn_get_local_transport_params(conn, &tparams);
+    int client_initial(ngtcp2_conn* conn_, void* user_data) {
+        Debug("######################", __func__);
 
-        std::array<uint8_t, 256> buf;
-        ngtcp2_ssize nwrite = ngtcp2_encode_transport_params(buf.data(), buf.size(), exttype, &tparams);
-        if (nwrite < 0)
-            return nwrite;
-        Debug("encoded transport params: ", make_printable(buf.data(), buf.data() + nwrite));
-        ngtcp2_conn_submit_crypto_data(conn, NGTCP2_CRYPTO_LEVEL_INITIAL, buf.data(), nwrite);
+        return static_cast<Connection*>(user_data)->init_client();
+    }
+    int recv_client_initial(ngtcp2_conn* conn_, const ngtcp2_cid* dcid, void* user_data) {
+        Debug("######################", __func__);
 
-        // FIXME: perhaps the crypto ctx init stuff should be here?
-        ngtcp2_conn_handshake_completed(conn);
-        // FIXME
+        auto& conn = *static_cast<Connection*>(user_data);
+        assert(conn_ == conn.conn.get());
+
+        if (0 != conn.setup_server_crypto_initial())
+            return FAIL;
+
         return 0;
     }
-    int recv_client_initial(ngtcp2_conn* conn, const ngtcp2_cid* dcid, void* user_data) {
-        Debug();
-        // FIXME
-        return 0;
-    }
-    int recv_crypto_data(ngtcp2_conn* conn, ngtcp2_crypto_level crypto_level, uint64_t offset, const uint8_t* data, size_t datalen, void* user_data) {
-        Debug();
-        // FIXME
+    int recv_crypto_data(ngtcp2_conn* conn_, ngtcp2_crypto_level crypto_level, uint64_t offset, const uint8_t* data, size_t datalen, void* user_data) {
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
+        Debug("Crypto level ", crypto_level);
+        Debug("Received ", datalen, " bytes: ", buffer_printer{data, datalen});
+
+        auto& conn = *static_cast<Connection*>(user_data);
+        switch (crypto_level) {
+            case NGTCP2_CRYPTO_LEVEL_EARLY:
+                // We don't currently use or support 0rtt
+                Warn("Invalid EARLY crypto level");
+                return FAIL;
+
+            case NGTCP2_CRYPTO_LEVEL_INITIAL:
+                // Nothing to do here
+                break;
+
+            case NGTCP2_CRYPTO_LEVEL_HANDSHAKE:
+                if (!conn.init_tx_handshake_key())
+                    return FAIL;
+                if (ngtcp2_conn_is_server(conn)) {
+                    if (auto rv = recv_transport_params(conn, {data, datalen}); rv != 0)
+                        return rv;
+                    if (auto rv = send_transport_params(conn); rv != 0)
+                        return rv;
+                }
+                break;
+
+            case NGTCP2_CRYPTO_LEVEL_APPLICATION:
+                if (!conn.init_tx_key())
+                    return FAIL;
+                break;
+
+            default:
+                Warn("Unhandled crypto_level ", crypto_level);
+                return FAIL;
+        }
+        conn.io_ready();
         return 0;
     }
     int encrypt(
@@ -69,26 +140,30 @@ namespace {
             const uint8_t* plaintext, size_t plaintextlen,
             const uint8_t* nonce, size_t noncelen,
             const uint8_t* ad, size_t adlen) {
-        Debug();
-        // FIXME
+        Debug("######################", __func__);
+        Debug("Lengths: ", plaintextlen, "+", noncelen, "+", adlen);
+        if (dest != plaintext)
+            std::memmove(dest, plaintext, plaintextlen);
         return 0;
     }
     int decrypt(
             uint8_t* dest,
             const ngtcp2_crypto_aead* aead, const ngtcp2_crypto_aead_ctx* aead_ctx,
-            const uint8_t* plaintext, size_t plaintextlen,
+            const uint8_t* ciphertext, size_t ciphertextlen,
             const uint8_t* nonce, size_t noncelen,
             const uint8_t* ad, size_t adlen) {
-        Debug();
-        // FIXME
+        Debug("######################", __func__);
+        Debug("Lengths: ", ciphertextlen, "+", noncelen, "+", adlen);
+        if (dest != ciphertext)
+            std::memmove(dest, ciphertext, ciphertextlen);
         return 0;
     }
     int hp_mask(
             uint8_t* dest,
             const ngtcp2_crypto_cipher* hp, const ngtcp2_crypto_cipher_ctx* hp_ctx,
             const uint8_t* sample) {
-        Debug();
-        // FIXME
+        Debug("######################", __func__);
+        memset(dest, 0, NGTCP2_HP_MASKLEN);
         return 0;
     }
     int recv_stream_data(
@@ -99,15 +174,17 @@ namespace {
             const uint8_t* data, size_t datalen,
             void* user_data,
             void* stream_user_data) {
-        Debug();
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
 
-    // Do we need acked_stream_data_offset?
+    // Do we need acked_stream_data_offset?  (Yes! need it to free the used buffer space)
 
     int stream_open(ngtcp2_conn* conn, int64_t stream_id, void* user_data) {
-        Debug();
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
@@ -117,19 +194,22 @@ namespace {
             uint64_t app_error_code,
             void* user_data,
             void* stream_user_data) {
-        Debug();
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
 
     // (client only)
     int recv_retry(ngtcp2_conn* conn, const ngtcp2_pkt_hd* hd, void* user_data) {
-        Debug();
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
     int extend_max_local_streams_bidi(ngtcp2_conn* conn, uint64_t max_streams, void* user_data) {
-        Debug();
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
@@ -137,19 +217,28 @@ namespace {
             uint8_t* dest, size_t destlen,
             const ngtcp2_rand_ctx* rand_ctx,
             [[maybe_unused]] ngtcp2_rand_usage usage) {
-        Debug();
+        Debug("######################", __func__);
         auto& rng = *static_cast<std::mt19937_64*>(rand_ctx->native_handle);
         random_bytes(dest, destlen, rng);
         return 0;
     }
     int get_new_connection_id(
-            ngtcp2_conn* conn, ngtcp2_cid* cid, uint8_t* token, size_t cidlen, void* user_data) {
-        Debug();
-        // FIXME
+            ngtcp2_conn* conn_, ngtcp2_cid* cid_, uint8_t* token, size_t cidlen, void* user_data) {
+        Debug("######################", __func__);
+
+        auto& conn = *static_cast<Connection*>(user_data);
+        auto cid = conn.make_alias_id(cidlen);
+        assert(cid.datalen == cidlen);
+        *cid_ = cid;
+
+        conn.endpoint.make_stateless_reset_token(cid, token);
+        Debug("make stateless reset token ", oxenmq::to_hex(token, token + NGTCP2_STATELESS_RESET_TOKENLEN));
+
         return 0;
     }
     int remove_connection_id(ngtcp2_conn* conn, const ngtcp2_cid* cid, void* user_data) {
-        Debug();
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
@@ -159,17 +248,20 @@ namespace {
             ngtcp2_crypto_aead_ctx* tx_aead_ctx, uint8_t* tx_iv,
             const uint8_t* current_rx_secret, const uint8_t* current_tx_secret,
             size_t secretlen, void* user_data) {
-        Debug();
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
     int handshake_confirmed(ngtcp2_conn* conn, void* user_data) {
-        Debug();
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
     int recv_new_token(ngtcp2_conn* conn, const ngtcp2_vec* token, void* user_data) {
-        Debug();
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
@@ -180,7 +272,8 @@ namespace {
             uint64_t app_error_code,
             void* user_data,
             void* stream_user_data) {
-        Debug();
+        Debug("######################", __func__);
+        Debug("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
@@ -203,7 +296,7 @@ io_result Connection::send() {
     io_result rv{};
     bstring_view send_data{send_buffer.data(), send_buffer_size};
     if (!send_data.empty()) {
-        Debug("Sending packet: ", make_printable(send_data));
+        Debug("Sending packet: ", buffer_printer{send_data});
         rv = endpoint.send_packet(path.remote, send_data);
         if (rv.blocked()) {
             uv_poll_start(&wpoll, UV_WRITABLE,
@@ -276,7 +369,7 @@ std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connectio
     tparams.initial_max_streams_bidi = 100;
     tparams.initial_max_streams_uni = 0;
     tparams.max_idle_timeout = std::chrono::milliseconds(IDLE_TIMEOUT).count();
-    tparams.active_connection_id_limit = 7;
+    tparams.active_connection_id_limit = 8;
 
     Debug("Done basic connection initialization");
 
@@ -285,7 +378,7 @@ std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connectio
 
 
 Connection::Connection(Server& s, const ConnectionID& scid, ngtcp2_pkt_hd& header, const Path& path)
-        : endpoint{s}, dest_cid{header.scid.data, header.scid.datalen}, path{path} {
+        : endpoint{s}, base_cid{scid}, dest_cid{header.scid.data, header.scid.datalen}, path{path} {
 
     auto [settings, tparams, cb] = init(s);
 
@@ -314,7 +407,7 @@ Connection::Connection(Server& s, const ConnectionID& scid, ngtcp2_pkt_hd& heade
 
 
 Connection::Connection(Client& c, const ConnectionID& scid, const Path& path)
-        : endpoint{c}, dest_cid{ConnectionID::random(c.rng)}, path{path} {
+        : endpoint{c}, base_cid{scid}, dest_cid{ConnectionID::random(c.rng)}, path{path} {
 
     auto [settings, tparams, cb] = init(c);
 
@@ -325,10 +418,8 @@ Connection::Connection(Client& c, const ConnectionID& scid, const Path& path)
     cb.recv_new_token = recv_new_token;
 
     ngtcp2_conn* connptr;
-    constexpr uint32_t version = 0xff000020u;
-    static_assert(version >= NGTCP2_PROTO_VER_MIN && version <= NGTCP2_PROTO_VER_MAX);
 
-    if (auto rv = ngtcp2_conn_client_new(&connptr, &dest_cid, &scid, path, version,
+    if (auto rv = ngtcp2_conn_client_new(&connptr, &dest_cid, &scid, path, NGTCP2_PROTO_VER_V1,
                 &cb, &settings, &tparams, nullptr, this);
             rv != 0)
         throw std::runtime_error{
@@ -339,13 +430,18 @@ Connection::Connection(Client& c, const ConnectionID& scid, const Path& path)
 }
 
 
+void Connection::io_ready() {
+    uv_async_send(io_trigger.get());
+}
+
 void Connection::io_callback() {
-    Debug();
-    // FIXME
+    Debug(__func__);
+    flush_streams();
+    Debug("done ", __func__);
 }
 
 void Connection::on_read(bstring_view data) {
-    Debug("data size: ", data.size());
+    Debug("FIXME UNIMPLEMENTED ", __func__, ", data size: ", data.size());
     // FIXME
 }
 
@@ -405,6 +501,7 @@ void Connection::flush_streams() {
         }
 
         auto [nwrite, consumed] = add_stream_data(stream_id, vecs.data(), bufs[1] ? 2 : 1);
+        Debug("add_stream_data for stream ", stream_id, " returned [", nwrite, ",", consumed, "]");
 
         if (nwrite == NGTCP2_ERR_WRITE_MORE) {
             Debug("consumed ", consumed, " bytes from stream ", stream_id, " and have space left");
@@ -428,6 +525,7 @@ void Connection::flush_streams() {
             stream.wrote(consumed);
         }
 
+        Debug("Sending stream data packet");
         if (!send_packet(nwrite))
             return;
     }
@@ -436,6 +534,7 @@ void Connection::flush_streams() {
     // and should finish off any partially-filled packet from above.
     for (;;) {
         auto [nwrite, consumed] = add_stream_data(-1, nullptr, 0);
+        Debug("add_stream_data for non-stream returned [", nwrite, ",", consumed, "]");
         assert(consumed <= 0);
         if (nwrite == NGTCP2_ERR_WRITE_MORE) {
             Debug("Writing non-stream data, and have space left");
@@ -449,9 +548,49 @@ void Connection::flush_streams() {
             return;
         }
 
+        Debug("Sending non-stream data packet");
         if (!send_packet(nwrite))
             return;
     }
+}
+
+Server* Connection::server() {
+    return dynamic_cast<Server*>(&endpoint);
+}
+
+Client* Connection::client() {
+    return dynamic_cast<Client*>(&endpoint);
+}
+
+int Connection::setup_server_crypto_initial() {
+    auto* s = server();
+    assert(s);
+    s->null_crypto.server_initial(*this);
+    io_ready();
+    return 0;
+}
+
+ConnectionID Connection::make_alias_id(size_t cidlen) {
+    return endpoint.add_connection_id(*this, cidlen);
+}
+
+int Connection::init_client() {
+    endpoint.null_crypto.client_initial(*this);
+
+    int rv = send_transport_params(*this);
+    if (rv == 0)
+        io_ready();
+    return rv;
+}
+
+bool Connection::init_tx_handshake_key() {
+    Debug(__func__);
+    return true;
+}
+
+bool Connection::init_tx_key() {
+    Debug(__func__);
+    return true;
 }
 
 }

@@ -27,6 +27,8 @@ add_library(quictest
     client.cpp
     connection.cpp
     endpoint.cpp
+    log.cpp
+    null-crypto.cpp
     server.cpp
     stream.cpp
     )
@@ -36,10 +38,11 @@ set_target_properties(ngtcp2 PROPERTIES IMPORTED_LOCATION ${NGTCP2_DIR}/lib/libn
 target_include_directories(ngtcp2 INTERFACE ${NGTCP2_DIR}/lib/includes ${NGTCP2_DIR}/../lib/includes)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBUV libuv>=1.18.0 IMPORTED_TARGET)
-pkg_check_modules(OXENMQ liboxenmq>=1.2.3 IMPORTED_TARGET)
+pkg_check_modules(LIBUV REQUIRED libuv>=1.18.0 IMPORTED_TARGET)
+pkg_check_modules(OXENMQ REQUIRED liboxenmq>=1.2.3 IMPORTED_TARGET)
+pkg_check_modules(SODIUM REQUIRED libsodium>=1.0.17 IMPORTED_TARGET)
 
-target_link_libraries(quictest PUBLIC ngtcp2 PkgConfig::LIBUV PkgConfig::OXENMQ)
+target_link_libraries(quictest PUBLIC ngtcp2 PkgConfig::LIBUV PkgConfig::OXENMQ PkgConfig::SODIUM)
 
 add_executable(echo-server echo-server.cpp)
 add_executable(echo-client echo-client.cpp)

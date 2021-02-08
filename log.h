@@ -1,12 +1,13 @@
 #pragma once
 
 #include <cstdarg>
+#include <cstddef>
+#include <iostream>
+#include <iomanip>
 #include <type_traits>
-#pragma once
 
 // Temporary logging code to be replaced with lokinet logging
 
-#include <iostream>
 #include <oxenmq/hex.h>
 
 #ifdef __cpp_lib_source_location
@@ -19,32 +20,25 @@ namespace slns = std::experimental;
 
 namespace quic {
 
-template <typename It>
-std::string make_printable(It begin, It end) {
-    static_assert(sizeof(*begin) == 1);
-    std::string out;
-    auto size = std::distance(begin, end);
-    out.reserve(size + 10);
-    out += "[" + std::to_string(size) + "]\"";
-    for (; begin != end; begin++) {
-        auto c = static_cast<uint8_t>(*begin);
-        if (c == '\\' || c == '"') {
-            out += '\\';
-            out += c;
-        } else if (c <= 0x1f || c >= 0x7f) {
-            out += "\\x";
-            out += oxenmq::to_hex(&c, &c+1);
-        } else {
-            out += c;
-        }
-    }
-    out += '"';
-    return out;
-}
-template <typename Container>
-std::string make_printable(const Container &cont) {
-    return make_printable(std::begin(cont), std::end(cont));
-}
+struct buffer_printer {
+    std::basic_string_view<std::byte> buf;
+
+    template <typename T, typename = std::enable_if_t<sizeof(T) == 1>>
+    explicit buffer_printer(std::basic_string_view<T> buf)
+        : buf{reinterpret_cast<const std::byte*>(buf.data()), buf.size()} {}
+
+    template <typename T, typename = std::enable_if_t<sizeof(T) == 1>>
+    explicit buffer_printer(const std::basic_string<T>& buf)
+        : buffer_printer(std::basic_string_view<T>{buf}) {}
+
+    template <typename T, typename = std::enable_if_t<sizeof(T) == 1>>
+    explicit buffer_printer(std::basic_string<T>&& buf) = delete;
+
+    template <typename T, typename = std::enable_if_t<sizeof(T) == 1>>
+    explicit buffer_printer(const T* data, size_t size)
+        : buffer_printer(std::basic_string_view<T>{data, size}) {}
+};
+std::ostream& operator<<(std::ostream& o, const buffer_printer& bp);
 
 namespace detail {
 
@@ -64,7 +58,12 @@ void log_print_vals(T&& val, More&&... more) {
 
 template <typename... T>
 void log_print(const slns::source_location& location, T&&... args) {
-    std::cerr << '[' << location.file_name() << ':' << location.line() << ']';
+    std::string_view filename{location.file_name()};
+    if (auto pos = filename.rfind('/'); pos != std::string::npos &&
+            (pos = filename.substr(0, pos).rfind('/')) != std::string::npos) {
+        filename.remove_prefix(pos+1);
+    }
+    std::cerr << "\e[3m[" << filename << ':' << location.line() << "]\e[23m";
     if constexpr (sizeof...(T)) {
         std::cerr << ": ";
         detail::log_print_vals(std::forward<T>(args)...);
@@ -91,11 +90,23 @@ template <typename... T> void Debug(T&&...) {}
 template <typename... T>
 struct Warn {
     Warn(T&&... args, const slns::source_location& location = slns::source_location::current()) {
-        std::cerr << "WRN";
+        std::cerr << "\e[33;1mWRN";
         detail::log_print(location, std::forward<T>(args)...);
+        std::cerr << "\e[0m";
     }
 };
 template <typename... T>
 Warn(T&&...) -> Warn<T...>;
+
+template <typename... T>
+struct Error {
+    Error(T&&... args, const slns::source_location& location = slns::source_location::current()) {
+        std::cerr << "\e[31;1mWRN";
+        detail::log_print(location, std::forward<T>(args)...);
+        std::cerr << "\e[0m";
+    }
+};
+template <typename... T>
+Error(T&&...) -> Error<T...>;
 
 }

@@ -2,15 +2,9 @@
 #include "client.h"
 #include "log.h"
 
+#include <oxenmq/variant.h>
+
 namespace quic {
-
-// Cranks a value to 11, i.e. set it to its maximum
-template <typename T>
-void crank_to_eleven(T& val) { val = std::numeric_limits<T>::max(); }
-
-static std::array<uint8_t, 32> null_secret{};
-static std::array<uint8_t, 16> null_iv{};
-static std::array<uint8_t, 4096> null_data{};
 
 Client::Client(Address remote, uv_loop_t* loop_, std::optional<Address> local_)
         : Endpoint{std::move(local_), loop_} {
@@ -30,38 +24,21 @@ Client::Client(Address remote, uv_loop_t* loop_, std::optional<Address> local_)
     // - delay_stream_timer
 
 
-    auto local_cid = ConnectionID::random(rng);
-    auto [it, ins] = conns.emplace(std::piecewise_construct,
-            std::forward_as_tuple(local_cid),
-            std::forward_as_tuple(*this, local_cid, path));
-    assert(ins);
-    auto& conn = it->second;
+    auto connptr = std::make_shared<Connection>(*this, ConnectionID::random(rng), path);
+    auto& conn = *connptr;
+    conns.emplace(conn.base_cid, connptr);
 
-    // FIXME: likely need to move this crap info connection.cpp, or maybe a "null_crypto.cpp"?
-    ngtcp2_crypto_ctx null_crypto{};
-    crank_to_eleven(null_crypto.max_encryption);
-    crank_to_eleven(null_crypto.max_decryption_failure);
+/*    Debug("set crypto ctx");
 
-    Debug("set crypto ctx");
-
-    ngtcp2_crypto_aead_ctx null_aead_ctx{};
-    ngtcp2_crypto_aead retry_aead{0, 16}; // FIXME: 16 overhead is for AES-128-GCM AEAD, but do we need it?
-    ngtcp2_crypto_cipher_ctx null_cipher_ctx{};
-
-    ngtcp2_conn_set_initial_crypto_ctx(conn, &null_crypto);
-    ngtcp2_conn_install_initial_key(conn, &null_aead_ctx, null_iv.data(), &null_cipher_ctx, &null_aead_ctx, null_iv.data(), &null_cipher_ctx, null_iv.size());
-    ngtcp2_conn_set_retry_aead(conn, &retry_aead, &null_aead_ctx);
-    ngtcp2_conn_set_crypto_ctx(conn, &null_crypto);
-    ngtcp2_conn_install_rx_handshake_key(conn, &null_aead_ctx, null_iv.data(), null_iv.size(), &null_cipher_ctx);
-    ngtcp2_conn_install_tx_handshake_key(conn, &null_aead_ctx, null_iv.data(), null_iv.size(), &null_cipher_ctx);
-    ngtcp2_conn_install_rx_key(conn, null_secret.data(), null_secret.size(), &null_aead_ctx, null_iv.data(), null_iv.size(), &null_cipher_ctx);
-    ngtcp2_conn_install_tx_key(conn, null_secret.data(), null_secret.size(), &null_aead_ctx, null_iv.data(), null_iv.size(), &null_cipher_ctx);
+    null_crypto.client_initial(conn);
 
     auto x = ngtcp2_conn_get_max_data_left(conn);
     Debug("mdl = ", x);
+    */
 
-    conn.flush_streams();
+    conn.io_ready();
 
+    /*
     Debug("Opening bidi stream");
     int64_t stream_id;
     if (auto rv = ngtcp2_conn_open_bidi_stream(conn, &stream_id, nullptr);
@@ -70,24 +47,28 @@ Client::Client(Address remote, uv_loop_t* loop_, std::optional<Address> local_)
         assert(rv == NGTCP2_ERR_STREAM_ID_BLOCKED);
     }
     else { Debug("Opening bidi stream good"); }
+    */
 }
 
 void Client::handle_packet(const Packet& p) {
-    version_info vi;
-    auto rv = ngtcp2_pkt_decode_version_cid(&vi.version, &vi.dcid, &vi.dcid_len, &vi.scid, &vi.scid_len,
-            u8data(p.data), p.data.size(), NGTCP2_MAX_CIDLEN);
-    if (rv == 1) // 1 means Version Negotiation should be sent
-        return send_version_negotiation(vi, p.path.remote);
-    else if (rv != 0) {
-        Warn("QUIC packet header decode failed: ", ngtcp2_strerror(rv));
+    Debug("Handling incoming client packet: ", buffer_printer{p.data});
+    auto maybe_dcid = handle_packet_init(p);
+    if (!maybe_dcid) return;
+    auto& dcid = *maybe_dcid;
+
+    Debug("Incoming connection id ", dcid);
+    auto [connptr, alias] = get_conn(dcid);
+    if (!connptr) {
+        Debug("CID is ", alias ? "expired alias" : "unknown/expired", "; dropping");
         return;
     }
+    auto& conn = *connptr;
+    if (alias)
+        Debug("CID is alias for primary CID ", conn.base_cid);
+    else
+        Debug("CID is primary CID");
 
-    if (vi.dcid_len > ConnectionID::max_size()) {
-        Warn("Internal error: destination ID is longer than should be allowed");
-        return;
-    }
-
+    handle_conn_packet(conn, p);
 }
 
 }
