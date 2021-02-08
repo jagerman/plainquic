@@ -208,20 +208,21 @@ io_result Endpoint::read_packet(const Packet& p, Connection& conn) {
     return {rv};
 }
 
-void Endpoint::update_ecn() {
-    if (ecn_curr != ecn_next) {
-        if (-1 == setsockopt(socket_fd(), IPPROTO_IP, IP_TOS, &ecn_next, static_cast<socklen_t>(sizeof(ecn_next))))
+void Endpoint::update_ecn(uint32_t ecn) {
+    assert(ecn <= std::numeric_limits<uint8_t>::max());
+    if (ecn_curr != ecn) {
+        if (-1 == setsockopt(socket_fd(), IPPROTO_IP, IP_TOS, &ecn, static_cast<socklen_t>(sizeof(ecn))))
             Warn("setsockopt failed to set IP_TOS: ", strerror(errno));
 
         // IPv6 version:
         //int tclass = this->ecn;
         //setsockopt(socket_fd(), IPPROTO_IPV6, IPV6_TCLASS, &tclass, static_cast<socklen_t>(sizeof(tclass)));
 
-        ecn_curr = ecn_next;
+        ecn_curr = ecn;
     }
 }
 
-io_result Endpoint::send_packet(const Address& to, bstring_view data) {
+io_result Endpoint::send_packet(const Address& to, bstring_view data, uint32_t ecn) {
     iovec msg_iov;
     msg_iov.iov_base = const_cast<std::byte*>(data.data());
     msg_iov.iov_len = data.size();
@@ -234,7 +235,7 @@ io_result Endpoint::send_packet(const Address& to, bstring_view data) {
 
     auto fd = socket_fd();
 
-    update_ecn();
+    update_ecn(ecn);
     ssize_t nwrite = 0;
     do {
         nwrite = sendmsg(fd, &msg, 0);
@@ -266,8 +267,7 @@ void Endpoint::send_version_negotiation(const version_info& vi, const Address& s
     if (nwrote <= 0)
         return;
 
-    ecn_next = 0;
-    send_packet(source, bstring_view{buf.data(), static_cast<size_t>(nwrote)});
+    send_packet(source, bstring_view{buf.data(), static_cast<size_t>(nwrote)}, 0);
 }
 
 void Endpoint::close_connection(Connection& conn, uint64_t code, bool application) {
@@ -297,8 +297,7 @@ void Endpoint::close_connection(Connection& conn, uint64_t code, bool applicatio
     }
     assert(conn.closing && !conn.conn_buffer.empty());
 
-    ecn_next = 0;
-    if (auto sent = send_packet(conn.path.remote, conn.conn_buffer);
+    if (auto sent = send_packet(conn.path.remote, conn.conn_buffer, 0);
             !sent) {
         Warn("Failed to send packet: ", strerror(sent.error_code), "; removing connection ", conn.base_cid);
         delete_conn(conn.base_cid);

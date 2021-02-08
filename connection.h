@@ -85,6 +85,7 @@ private:
     // Packet data storage for a packet we are currently sending
     std::array<std::byte, NGTCP2_MAX_PKTLEN_IPV4> send_buffer{};
     size_t send_buffer_size = 0;
+    ngtcp2_pkt_info send_pkt_info{};
 
     // Attempts to send the packet in `send_buffer`.  If sending blocks then we set up a write poll
     // on the socket to wait for it to become available, and return an io_result with `.blocked()`

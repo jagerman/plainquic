@@ -295,9 +295,10 @@ io_result Connection::send() {
     assert(send_buffer_size <= send_buffer.size());
     io_result rv{};
     bstring_view send_data{send_buffer.data(), send_buffer_size};
+
     if (!send_data.empty()) {
         Debug("Sending packet: ", buffer_printer{send_data});
-        rv = endpoint.send_packet(path.remote, send_data);
+        rv = endpoint.send_packet(path.remote, send_data, send_pkt_info.ecn);
         if (rv.blocked()) {
             uv_poll_start(&wpoll, UV_WRITABLE,
                     [](uv_poll_t* handle, int status, int events) {
@@ -447,7 +448,6 @@ void Connection::on_read(bstring_view data) {
 
 void Connection::flush_streams() {
     // conn, path, pi, dest, destlen, and ts
-    ngtcp2_pkt_info pi;
     std::optional<uint64_t> ts;
 
     auto add_stream_data = [&](int64_t stream_id, const ngtcp2_vec* datav, size_t datalen) {
@@ -456,7 +456,7 @@ void Connection::flush_streams() {
         if (!ts) ts = get_timestamp();
 
         nwrite = ngtcp2_conn_writev_stream(
-                conn.get(), &path.path, &pi,
+                conn.get(), &path.path, &send_pkt_info,
                 u8data(send_buffer),
                 send_buffer.size(),
                 &consumed,

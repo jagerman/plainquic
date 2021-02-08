@@ -34,9 +34,6 @@ protected:
     Address local;
     // The current outgoing IP ecn value for the socket
     uint8_t ecn_curr = 0;
-    // The ecn we want for the next packet (we defer actually making the syscall until we actually
-    // try to send such a packet and it differs from ecn_curr).
-    uint8_t ecn_next = 0;
 
     //uv_udp_t sock;
     uv_poll_t poll;
@@ -147,21 +144,21 @@ protected:
     // Sets up the ECN IP field (IP_TOS for IPv4) for the next outgoing packet sent via
     // send_packet().  This does the actual syscall (if ECN is different than currently set), and is
     // typically called implicitly via send_packet().
-    void update_ecn();
+    void update_ecn(uint32_t ecn);
 
     // Sends a packet to `to` containing `data`. Returns a non-error io_result on success,
     // an io_result with .error_code set to the errno of the failure on failure.
-    io_result send_packet(const Address& to, bstring_view data);
+    io_result send_packet(const Address& to, bstring_view data, uint32_t ecn);
 
     // Wrapper around the above that takes a regular std::string_view (i.e. of chars) and recasts
     // it to an string_view of std::bytes.
-    io_result send_packet(const Address& to, std::string_view data) {
-        return send_packet(to, bstring_view{reinterpret_cast<const std::byte*>(data.data()), data.size()});
+    io_result send_packet(const Address& to, std::string_view data, uint32_t ecn) {
+        return send_packet(to, bstring_view{reinterpret_cast<const std::byte*>(data.data()), data.size()}, ecn);
     }
 
     // Another wrapper taking a vector
-    io_result send_packet(const Address& to, const std::vector<std::byte>& data) {
-        return send_packet(to, bstring_view{data.data(), data.size()});
+    io_result send_packet(const Address& to, const std::vector<std::byte>& data, uint32_t ecn) {
+        return send_packet(to, bstring_view{data.data(), data.size()}, ecn);
     }
 
     void send_version_negotiation(const version_info& vi, const Address& source);
