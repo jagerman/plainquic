@@ -29,50 +29,6 @@ std::ostream& operator<<(std::ostream& o, const ConnectionID& c) {
 }
 
 namespace {
-
-int recv_transport_params(Connection& c, std::basic_string_view<uint8_t> data) {
-    ngtcp2_transport_params params;
-
-    auto exttype = ngtcp2_conn_is_server(c)
-        ? NGTCP2_TRANSPORT_PARAMS_TYPE_CLIENT_HELLO
-        : NGTCP2_TRANSPORT_PARAMS_TYPE_ENCRYPTED_EXTENSIONS;
-
-    auto rv = ngtcp2_decode_transport_params(&params, exttype, data.data(), data.size());
-    Debug("Decode transport params ", rv == 0 ? "success" : "fail: "s + ngtcp2_strerror(rv));
-    if (rv == 0) {
-        rv = ngtcp2_conn_set_remote_transport_params(c, &params);
-        Debug("Set remote transport params ", rv == 0 ? "success" : "fail: "s + ngtcp2_strerror(rv));
-    }
-
-    if (rv != 0)
-        ngtcp2_conn_set_tls_error(c, rv);
-    return rv;
-}
-
-int send_transport_params(Connection& c) {
-    ngtcp2_transport_params tparams;
-    ngtcp2_conn_get_local_transport_params(c, &tparams);
-
-    assert(c.conn_buffer.empty());
-    static_assert(NGTCP2_MAX_PKTLEN_IPV4 > NGTCP2_MAX_PKTLEN_IPV6);
-    c.conn_buffer.resize(NGTCP2_MAX_PKTLEN_IPV4);
-
-    auto exttype = ngtcp2_conn_is_server(c)
-        ? NGTCP2_TRANSPORT_PARAMS_TYPE_ENCRYPTED_EXTENSIONS
-        : NGTCP2_TRANSPORT_PARAMS_TYPE_CLIENT_HELLO;
-
-    if (ngtcp2_ssize nwrite = ngtcp2_encode_transport_params(u8data(c.conn_buffer), c.conn_buffer.size(), exttype, &tparams);
-            nwrite >= 0)
-        c.conn_buffer.resize(nwrite);
-    else
-        return nwrite;
-    Debug("encoded transport params: ", buffer_printer{c.conn_buffer});
-    ngtcp2_conn_submit_crypto_data(c, NGTCP2_CRYPTO_LEVEL_INITIAL, u8data(c.conn_buffer), c.conn_buffer.size());
-
-    return 0;
-}
-
-
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
@@ -81,10 +37,17 @@ int send_transport_params(Connection& c) {
     int client_initial(ngtcp2_conn* conn_, void* user_data) {
         Debug("######################", __func__);
 
+        // Initialization the connection and send our transport parameters to the server.  This will
+        // put the connection into NGTCP2_CS_CLIENT_WAIT_HANDSHAKE state.
         return static_cast<Connection*>(user_data)->init_client();
     }
     int recv_client_initial(ngtcp2_conn* conn_, const ngtcp2_cid* dcid, void* user_data) {
         Debug("######################", __func__);
+
+
+        // New incoming connection from a client: our server connection starts out here in state
+        // NGTCP2_CS_SERVER_INITIAL, but we should immediately get into recv_crypto_data because the
+        // initial client packet should contain the client's transport parameters.
 
         auto& conn = *static_cast<Connection*>(user_data);
         assert(conn_ == conn.conn.get());
@@ -94,11 +57,9 @@ int send_transport_params(Connection& c) {
 
         return 0;
     }
-    int recv_crypto_data(ngtcp2_conn* conn_, ngtcp2_crypto_level crypto_level, uint64_t offset, const uint8_t* data, size_t datalen, void* user_data) {
-        Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
-        Debug("Crypto level ", crypto_level);
-        Debug("Received ", datalen, " bytes: ", buffer_printer{data, datalen});
+    int recv_crypto_data(ngtcp2_conn* conn_, ngtcp2_crypto_level crypto_level, uint64_t offset, const uint8_t* rawdata, size_t rawdatalen, void* user_data) {
+        std::basic_string_view data{rawdata, rawdatalen};
+        Debug("\e[32;1mReceiving crypto data @ level ", crypto_level, "\e[0m ", buffer_printer{data});
 
         auto& conn = *static_cast<Connection*>(user_data);
         switch (crypto_level) {
@@ -108,23 +69,48 @@ int send_transport_params(Connection& c) {
                 return FAIL;
 
             case NGTCP2_CRYPTO_LEVEL_INITIAL:
-                // Nothing to do here
+                // "Initial" level means we are still handshaking; if we are server then we receive
+                // the client's transport params (sent in client_initial, above) and blast ours
+                // back.  If we are a client then getting here means we received a response from the
+                // server, which is that returned server transport params.
+
+                if (auto rv = conn.recv_initial_crypto(data); rv != 0)
+                    return rv;
+
+                if (ngtcp2_conn_is_server(conn)) {
+                    if (auto rv = conn.send_magic(NGTCP2_CRYPTO_LEVEL_INITIAL); rv != 0)
+                        return rv;
+                    if (auto rv = conn.send_transport_params(NGTCP2_CRYPTO_LEVEL_HANDSHAKE); rv != 0)
+                        return rv;
+                }
+
                 break;
 
             case NGTCP2_CRYPTO_LEVEL_HANDSHAKE:
-                if (!conn.init_tx_handshake_key())
-                    return FAIL;
-                if (ngtcp2_conn_is_server(conn)) {
-                    if (auto rv = recv_transport_params(conn, {data, datalen}); rv != 0)
+
+                if (!ngtcp2_conn_is_server(conn)) {
+                    if (auto rv = conn.recv_transport_params(data); rv != 0)
                         return rv;
-                    if (auto rv = send_transport_params(conn); rv != 0)
+                    // At this stage of the protocol with TLS the client sends back TLS info so that
+                    // the server can install our rx key; we have to send *something* back to invoke
+                    // the server's HANDSHAKE callback (so that it knows handshake is complete) so
+                    // sent the magic again.
+                    if (auto rv = conn.send_magic(NGTCP2_CRYPTO_LEVEL_HANDSHAKE); rv != 0)
                         return rv;
+                } else {
+                    // Check that we received the above as expected
+                    if (data != handshake_magic) {
+                        Warn("Invalid handshake crypto frame from client: did not find expected magic");
+                        return NGTCP2_ERR_CALLBACK_FAILURE;
+                    }
                 }
+
+                conn.complete_handshake();
                 break;
 
             case NGTCP2_CRYPTO_LEVEL_APPLICATION:
-                if (!conn.init_tx_key())
-                    return FAIL;
+                //if (!conn.init_tx_key())
+                //    return FAIL;
                 break;
 
             default:
@@ -175,7 +161,7 @@ int send_transport_params(Connection& c) {
             void* user_data,
             void* stream_user_data) {
         Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
+        Error("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
@@ -184,7 +170,7 @@ int send_transport_params(Connection& c) {
 
     int stream_open(ngtcp2_conn* conn, int64_t stream_id, void* user_data) {
         Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
+        Error("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
@@ -195,7 +181,7 @@ int send_transport_params(Connection& c) {
             void* user_data,
             void* stream_user_data) {
         Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
+        Error("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
@@ -203,16 +189,18 @@ int send_transport_params(Connection& c) {
     // (client only)
     int recv_retry(ngtcp2_conn* conn, const ngtcp2_pkt_hd* hd, void* user_data) {
         Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
+        Error("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
+    /*
     int extend_max_local_streams_bidi(ngtcp2_conn* conn, uint64_t max_streams, void* user_data) {
         Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
+        Error("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
+    */
     int rand(
             uint8_t* dest, size_t destlen,
             const ngtcp2_rand_ctx* rand_ctx,
@@ -238,7 +226,7 @@ int send_transport_params(Connection& c) {
     }
     int remove_connection_id(ngtcp2_conn* conn, const ngtcp2_cid* cid, void* user_data) {
         Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
+        Error("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
@@ -248,23 +236,17 @@ int send_transport_params(Connection& c) {
             ngtcp2_crypto_aead_ctx* tx_aead_ctx, uint8_t* tx_iv,
             const uint8_t* current_rx_secret, const uint8_t* current_tx_secret,
             size_t secretlen, void* user_data) {
-        Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
-        // FIXME
+        // This is a no-op since we don't encrypt anything in the first place
         return 0;
     }
-    int handshake_confirmed(ngtcp2_conn* conn, void* user_data) {
-        Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
-        // FIXME
-        return 0;
-    }
+    /*
     int recv_new_token(ngtcp2_conn* conn, const ngtcp2_vec* token, void* user_data) {
         Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
+        Error("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
+    */
     int stream_reset(
             ngtcp2_conn* conn,
             int64_t stream_id,
@@ -273,7 +255,7 @@ int send_transport_params(Connection& c) {
             void* user_data,
             void* stream_user_data) {
         Debug("######################", __func__);
-        Debug("FIXME UNIMPLEMENTED ", __func__);
+        Error("FIXME UNIMPLEMENTED ", __func__);
         // FIXME
         return 0;
     }
@@ -378,8 +360,8 @@ std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connectio
 }
 
 
-Connection::Connection(Server& s, const ConnectionID& scid, ngtcp2_pkt_hd& header, const Path& path)
-        : endpoint{s}, base_cid{scid}, dest_cid{header.scid.data, header.scid.datalen}, path{path} {
+Connection::Connection(Server& s, const ConnectionID& base_cid_, ngtcp2_pkt_hd& header, const Path& path)
+        : endpoint{s}, base_cid{base_cid_}, dest_cid{header.scid}, path{path} {
 
     auto [settings, tparams, cb] = init(s);
 
@@ -388,22 +370,49 @@ Connection::Connection(Server& s, const ConnectionID& scid, ngtcp2_pkt_hd& heade
 
     Debug("header.type = ", +header.type);
 
-    tparams.original_dcid = scid;
+    // ConnectionIDs are a little complicated:
+    // - when a client creates a new connection to us, it creates a random source connection ID
+    //   *and* a random destination connection id.  The server won't have that connection ID, of
+    //   course, but we use it to recognize that we should try accepting it as a new connection.
+    // - When we talk to the client we use the random source connection ID that it generated as our
+    //   destination connection ID.
+    // - We choose our own source ID, however: we *don't* use the random one the client picked for
+    //   us.  Instead we generate a random one and sent it back as *our* source connection ID in the
+    //   reply to the client.
+    // - the client still needs to match up that reply with that request, and so we include the
+    //   destination connection ID that the client generated for us in the transport parameters as
+    //   the original_dcid: this lets the client match up the request, after which it can't promptly
+    //   forget about it and start using the source CID that we gave it.
+    //
+    // So, in other words, the conversation goes like this:
+    // - Client: [SCID:clientid, DCID:randomid, TRANSPORT_PARAMS]
+    // - Server: [SCID:serverid, DCID:clientid TRANSPORT_PARAMS(origid=randomid)]
+    //
+    // - For the client, .base_cid={clientid} and .dest_cid={randomid} initially but gets updated to
+    // .dest_cid={serverid} when we hear back from the server.
+    // - For the server, .base_cid={serverid} and .dest_cid={clientid}
+
+    tparams.original_dcid = header.dcid;
+
+    Debug("original_dcid is now set to ", ConnectionID(tparams.original_dcid));
+
+
     settings.token = header.token;
+
     // FIXME is this required?
     random_bytes(std::begin(tparams.stateless_reset_token), sizeof(tparams.stateless_reset_token), s.rng);
     tparams.stateless_reset_token_present = 1;
 
     ngtcp2_conn* connptr;
     Debug("server_new, path=", path);
-    if (auto rv = ngtcp2_conn_server_new(&connptr, &dest_cid, &scid, path, header.version,
+    if (auto rv = ngtcp2_conn_server_new(&connptr, &dest_cid, &base_cid, path, header.version,
                 &cb, &settings, &tparams, nullptr /*default mem allocator*/, this);
             rv != 0)
         throw std::runtime_error{
             "Failed to initialize server connection: "s + ngtcp2_strerror(rv)};
     conn.reset(connptr);
 
-    Debug("Created new server conn ", scid);
+    Debug("Created new server conn ", base_cid);
 }
 
 
@@ -414,9 +423,8 @@ Connection::Connection(Client& c, const ConnectionID& scid, const Path& path)
 
     cb.client_initial = client_initial;
     cb.recv_retry = recv_retry;
-    cb.extend_max_local_streams_bidi = extend_max_local_streams_bidi;
-    cb.handshake_confirmed = handshake_confirmed;
-    cb.recv_new_token = recv_new_token;
+    //cb.extend_max_local_streams_bidi = extend_max_local_streams_bidi;
+    //cb.recv_new_token = recv_new_token;
 
     ngtcp2_conn* connptr;
 
@@ -577,20 +585,110 @@ ConnectionID Connection::make_alias_id(size_t cidlen) {
 int Connection::init_client() {
     endpoint.null_crypto.client_initial(*this);
 
-    int rv = send_transport_params(*this);
-    if (rv == 0)
-        io_ready();
-    return rv;
+    if (int rv = send_magic(NGTCP2_CRYPTO_LEVEL_INITIAL); rv != 0)
+        return rv;
+    if (int rv = send_transport_params(NGTCP2_CRYPTO_LEVEL_INITIAL); rv != 0)
+        return rv;
+
+    io_ready();
+    return 0;
 }
 
-bool Connection::init_tx_handshake_key() {
-    Debug(__func__);
-    return true;
+int Connection::recv_initial_crypto(std::basic_string_view<uint8_t> data) {
+
+    if (data.substr(0, handshake_magic.size()) != handshake_magic) {
+        Warn("Invalid initial crypto frame: did not find expected magic prefix");
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    data.remove_prefix(handshake_magic.size());
+
+    const bool is_server = ngtcp2_conn_is_server(*this);
+    if (is_server) {
+        // For a server, we receive the transport parameters in the initial packet (prepended by the
+        // magic that we just removed):
+        if (auto rv = recv_transport_params(data); rv != 0)
+            return rv;
+    } else {
+        // For a client our initial crypto data should be just the magic string (the packet also
+        // contains transport parameters, but they are at HANDSHAKE crypto level and so will result
+        // in a second callback to handle them).
+        if (!data.empty()) {
+            Warn("Invalid initial crypto frame: unexpected post-magic data found");
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+    }
+
+    endpoint.null_crypto.install_rx_handshake_key(*this);
+    endpoint.null_crypto.install_tx_handshake_key(*this);
+    if (is_server)
+        endpoint.null_crypto.install_tx_key(*this);
+
+    return 0;
 }
 
-bool Connection::init_tx_key() {
-    Debug(__func__);
-    return true;
+void Connection::complete_handshake() {
+    endpoint.null_crypto.install_rx_key(*this);
+    if (!ngtcp2_conn_is_server(*this))
+        endpoint.null_crypto.install_tx_key(*this);
+    ngtcp2_conn_handshake_completed(*this);
 }
+
+int Connection::recv_transport_params(std::basic_string_view<uint8_t> data) {
+    ngtcp2_transport_params params;
+
+    auto exttype = ngtcp2_conn_is_server(*this)
+        ? NGTCP2_TRANSPORT_PARAMS_TYPE_CLIENT_HELLO
+        : NGTCP2_TRANSPORT_PARAMS_TYPE_ENCRYPTED_EXTENSIONS;
+
+    auto rv = ngtcp2_decode_transport_params(&params, exttype, data.data(), data.size());
+    Debug("Decode transport params ", rv == 0 ? "success" : "fail: "s + ngtcp2_strerror(rv));
+    Debug("params orig dcid = ", ConnectionID(params.original_dcid));
+    Debug("params init scid = ", ConnectionID(params.initial_scid));
+    if (rv == 0) {
+        rv = ngtcp2_conn_set_remote_transport_params(*this, &params);
+        Debug("Set remote transport params ", rv == 0 ? "success" : "fail: "s + ngtcp2_strerror(rv));
+    }
+
+    if (rv != 0) {
+        ngtcp2_conn_set_tls_error(*this, rv);
+        return rv;
+    }
+
+    return 0;
+}
+
+// Sends our magic string at the given level.  This fixed magic string is taking the place of TLS
+// parameters in full QUIC.
+int Connection::send_magic(ngtcp2_crypto_level level) {
+    return ngtcp2_conn_submit_crypto_data(*this, level, handshake_magic.data(), handshake_magic.size());
+}
+
+// Sends transport parameters.  `level` is expected to be INITIAL for clients (which send the
+// transport parameters in the initial packet), or HANDSHAKE for servers.
+int Connection::send_transport_params(ngtcp2_crypto_level level) {
+    ngtcp2_transport_params tparams;
+    ngtcp2_conn_get_local_transport_params(*this, &tparams);
+
+    assert(conn_buffer.empty());
+    static_assert(NGTCP2_MAX_PKTLEN_IPV4 > NGTCP2_MAX_PKTLEN_IPV6);
+    conn_buffer.resize(NGTCP2_MAX_PKTLEN_IPV4);
+
+    auto exttype = ngtcp2_conn_is_server(*this)
+        ? NGTCP2_TRANSPORT_PARAMS_TYPE_ENCRYPTED_EXTENSIONS
+        : NGTCP2_TRANSPORT_PARAMS_TYPE_CLIENT_HELLO;
+
+    if (ngtcp2_ssize nwrite = ngtcp2_encode_transport_params(
+                u8data(conn_buffer), conn_buffer.size(), exttype, &tparams);
+            nwrite >= 0) {
+        assert(nwrite > 0);
+        conn_buffer.resize(nwrite);
+    } else {
+        conn_buffer.clear();
+        return nwrite;
+    }
+    Debug("encoded transport params: ", buffer_printer{conn_buffer});
+    return ngtcp2_conn_submit_crypto_data(*this, level, u8data(conn_buffer), conn_buffer.size());
+}
+
 
 }

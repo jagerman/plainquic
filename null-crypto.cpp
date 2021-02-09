@@ -31,16 +31,16 @@ void NullCrypto::server_initial(Connection& conn) {
 }
 
 bool NullCrypto::install_tx_handshake_key(Connection& conn) {
-    return ngtcp2_conn_install_tx_handshake_key(conn, &null_aead_ctx, nullptr, 0, &null_cipher_ctx) == 0;
+    return ngtcp2_conn_install_tx_handshake_key(conn, &null_aead_ctx, null_iv.data(), null_iv.size(), &null_cipher_ctx) == 0;
 }
 bool NullCrypto::install_rx_handshake_key(Connection& conn) {
-    return ngtcp2_conn_install_rx_handshake_key(conn, &null_aead_ctx, nullptr, 0, &null_cipher_ctx) == 0;
+    return ngtcp2_conn_install_rx_handshake_key(conn, &null_aead_ctx, null_iv.data(), null_iv.size(), &null_cipher_ctx) == 0;
 }
 bool NullCrypto::install_tx_key(Connection& conn) {
-    return ngtcp2_conn_install_tx_key(conn, nullptr, 0, &null_aead_ctx, nullptr, 0, &null_cipher_ctx) == 0;
+    return ngtcp2_conn_install_tx_key(conn, null_iv.data(), null_iv.size(), &null_aead_ctx, null_iv.data(), null_iv.size(), &null_cipher_ctx) == 0;
 }
 bool NullCrypto::install_rx_key(Connection& conn) {
-    return ngtcp2_conn_install_rx_key(conn, nullptr, 0, &null_aead_ctx, nullptr, 0, &null_cipher_ctx) == 0;
+    return ngtcp2_conn_install_rx_key(conn, nullptr, 0, &null_aead_ctx, null_iv.data(), null_iv.size(), &null_cipher_ctx) == 0;
 }
 
 }
