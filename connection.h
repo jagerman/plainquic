@@ -66,13 +66,12 @@ template <> struct hash<quic::ConnectionID> {
 }
 namespace quic {
 
-/// Returns the current (monotonic) time
-inline auto now() { return std::chrono::steady_clock::now(); }
+/// Returns the current (monotonic) time as a time_point
+inline auto get_time() { return std::chrono::steady_clock::now(); }
 
-/// Returns a monotonic nanosecond timestamp as ngtcp2 expects.
-inline uint64_t get_timestamp() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now().time_since_epoch()).count();
+/// Converts a time_point as returned by get_time to a nanosecond timestamp (as ngtcp2 expects).
+inline uint64_t get_timestamp(const std::chrono::steady_clock::time_point &t = get_time()) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
 }
 
 // Stores an established connection between server/client.

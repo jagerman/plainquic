@@ -314,17 +314,16 @@ void Endpoint::start_draining(Connection& conn) {
     Debug("Putting ", conn.base_cid, " into draining mode");
     conn.draining = true;
     // Recommended draining time is 3*Probe Timeout
-    draining.emplace(conn.base_cid, now() + ngtcp2_conn_get_pto(conn) * 3 * 1ns);
+    draining.emplace(conn.base_cid, get_time() + ngtcp2_conn_get_pto(conn) * 3 * 1ns);
 }
 
 void Endpoint::check_timeouts() {
-    auto expired = now();
-    uint64_t expired_ts = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            expired.time_since_epoch()).count();
+    auto now = get_time();
+    uint64_t now_ts = get_timestamp(now);
 
     // Destroy any connections that are finished draining
     bool cleanup = false;
-    while (!draining.empty() && draining.front().second < expired) {
+    while (!draining.empty() && draining.front().second < now) {
         if (auto it = conns.find(draining.front().first); it != conns.end()) {
             if (std::holds_alternative<primary_conn_ptr>(it->second))
                 cleanup = true;
@@ -340,7 +339,7 @@ void Endpoint::check_timeouts() {
         if (auto *conn_ptr = std::get_if<primary_conn_ptr>(&it->second)) {
             Connection& conn = **conn_ptr;
             auto exp = ngtcp2_conn_get_idle_expiry(conn);
-            if (exp >= expired_ts || conn.draining)
+            if (exp >= now_ts || conn.draining)
                 continue;
             start_draining(conn);
         }
