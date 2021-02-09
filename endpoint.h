@@ -26,7 +26,7 @@ namespace quic {
 
 using namespace std::literals;
 
-inline constexpr auto IDLE_TIMEOUT = 60s;
+inline constexpr auto IDLE_TIMEOUT = 5min;
 
 class Endpoint {
 protected:

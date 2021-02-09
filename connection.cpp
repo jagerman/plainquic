@@ -351,7 +351,7 @@ std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connectio
     // Max *cumulative* streams we support on a connection:
     tparams.initial_max_streams_bidi = 100;
     tparams.initial_max_streams_uni = 0;
-    tparams.max_idle_timeout = std::chrono::milliseconds(IDLE_TIMEOUT).count();
+    tparams.max_idle_timeout = std::chrono::nanoseconds(IDLE_TIMEOUT).count();
     tparams.active_connection_id_limit = 8;
 
     Debug("Done basic connection initialization");
