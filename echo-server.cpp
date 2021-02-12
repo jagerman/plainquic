@@ -2,24 +2,33 @@
 #include "server.h"
 #include "log.h"
 
+#include <uvw.hpp>
 
-struct uv_destroyer {
-    void operator()(uv_loop_t* ptr) {
-        uv_loop_close(ptr);
-        free(ptr);
-    }
-};
+void listen(uvw::Loop &loop) {
+    std::shared_ptr<uvw::TCPHandle> tcp = loop.resource<uvw::TCPHandle>();
+
+    tcp->on<uvw::ListenEvent>([](const uvw::ListenEvent &, uvw::TCPHandle &srv) {
+        std::shared_ptr<uvw::TCPHandle> client = srv.loop().resource<uvw::TCPHandle>();
+
+        client->on<uvw::CloseEvent>([ptr = srv.shared_from_this()](const uvw::CloseEvent &, uvw::TCPHandle &) { ptr->close(); });
+        client->on<uvw::EndEvent>([](const uvw::EndEvent &, uvw::TCPHandle &client) { client.close(); });
+
+        srv.accept(*client);
+        client->read();
+    });
+
+    tcp->bind("127.0.0.1", 4242);
+    tcp->listen();
+}
 
 int main() {
-    std::unique_ptr<uv_loop_t, uv_destroyer> loop_ptr{new uv_loop_t};
-    auto* loop = loop_ptr.get();
-    uv_loop_init(loop);
+    auto loop = uvw::Loop::create();
 
     quic::Debug("Initializing server");
     quic::Server s{{{127,0,0,1}, 4242}, loop};
     quic::Debug("Initialized server");
 
-    uv_run(loop, UV_RUN_DEFAULT);
+    loop->run();
 
     return 0;
 }

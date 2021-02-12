@@ -43,6 +43,7 @@ pkg_check_modules(OXENMQ REQUIRED liboxenmq>=1.2.3 IMPORTED_TARGET)
 pkg_check_modules(SODIUM REQUIRED libsodium>=1.0.17 IMPORTED_TARGET)
 
 target_link_libraries(quictest PUBLIC ngtcp2 PkgConfig::LIBUV PkgConfig::OXENMQ PkgConfig::SODIUM)
+target_include_directories(quictest PUBLIC uvw/src)
 
 add_executable(echo-server echo-server.cpp)
 add_executable(echo-client echo-client.cpp)

@@ -16,7 +16,9 @@
 #include <variant>
 #include <vector>
 
-#include <uv.h>
+#include <uvw/loop.h>
+#include <uvw/poll.h>
+#include <uvw/timer.h>
 
 #if defined(__linux__) && !defined(NO_RECVMMSG)
 #  define LOKINET_HAVE_RECVMMSG
@@ -35,10 +37,9 @@ protected:
     // The current outgoing IP ecn value for the socket
     uint8_t ecn_curr = 0;
 
-    //uv_udp_t sock;
-    uv_poll_t poll;
-    uv_timer_t expiry_timer;
-    uv_loop_t* loop;
+    std::shared_ptr<uvw::PollHandle> poll;
+    std::shared_ptr<uvw::TimerHandle> expiry_timer;
+    std::shared_ptr<uvw::Loop> loop;
 
     // How many messages (at most) we recv per callback:
     static constexpr size_t N_msgs = 8;
@@ -105,18 +106,14 @@ protected:
     // `bind` - address we should bind to.  Required for a server, optional for a client.  If
     // omitted, no explicit bind is performed (which means the socket will be implicitly bound to
     // some OS-determined random high bind port).
-    // `loop` - the uv_loop pointer managing polling of this endpoint
-    Endpoint(std::optional<Address> bind, uv_loop_t* loop);
+    // `loop` - the uv loop pointer managing polling of this endpoint
+    Endpoint(std::optional<Address> bind, std::shared_ptr<uvw::Loop> loop);
 
-    virtual ~Endpoint() = default;
+    virtual ~Endpoint();
 
-    int socket_fd() const {
-        int ret;
-        uv_fileno(reinterpret_cast<const uv_handle_t*>(&poll), &ret);
-        return ret;
-    }
+    int socket_fd() const;
 
-    void poll_callback(int status, int events);
+    void on_readable();
 
     // Version & connection id info that we can potentially extract when decoding a packet
     struct version_info {

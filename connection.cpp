@@ -3,12 +3,16 @@
 #include "client.h"
 
 #include <cassert>
+#include <charconv>
 #include <cstring>
 #include <iostream>
 
 #include "log.h"
+#include "uvw/async.h"
+#include "uvw/poll.h"
 
 #include <oxenmq/hex.h>
+#include <oxenmq/bt_serialize.h>
 
 // DEBUG
 extern "C" {
@@ -282,14 +286,21 @@ io_result Connection::send() {
         Debug("Sending packet: ", buffer_printer{send_data});
         rv = endpoint.send_packet(path.remote, send_data, send_pkt_info.ecn);
         if (rv.blocked()) {
-            uv_poll_start(&wpoll, UV_WRITABLE,
-                    [](uv_poll_t* handle, int status, int events) {
-                        static_cast<Connection*>(handle->data)->send();
-                    });
-            wpoll_active = true;
+            if (!wpoll) {
+                wpoll = endpoint.loop->resource<uvw::PollHandle>(endpoint.socket_fd());
+                wpoll->on<uvw::PollEvent>([this] (const auto&, auto&) { send(); });
+            }
+            if (!wpoll_active) {
+                wpoll->start(uvw::PollHandle::Event::WRITABLE);
+                wpoll_active = true;
+            }
         } else if (!rv) {
             // FIXME: disconnect here?
             Warn("packet send failed: ", rv.str());
+            Error("FIXME - should disconnect");
+        } else if (wpoll_active) {
+            wpoll->stop();
+            wpoll_active = false;
         }
     }
     return rv;
@@ -308,14 +319,8 @@ io_result Connection::send() {
 
 std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connection::init(Endpoint& ep) {
     Debug("loop: ", ep.loop);
-    io_trigger.reset(new uv_async_t);
-    io_trigger->data = this;
-    uv_async_init(ep.loop, io_trigger.get(),
-            [](uv_async_t* a) { static_cast<Connection*>(a->data)->io_callback(); });
-
-    wpoll.data = this;
-    uv_poll_init(ep.loop, &wpoll, ep.socket_fd());
-    // Don't start wpoll now; we only start it up temporarily when a send blocks.
+    io_trigger = ep.loop->resource<uvw::AsyncHandle>();
+    io_trigger->on<uvw::AsyncEvent>([this] (auto&, auto&) { on_io_ready(); });
 
     auto result = std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks>{};
     auto& [settings, tparams, cb] = result;
@@ -416,8 +421,8 @@ Connection::Connection(Server& s, const ConnectionID& base_cid_, ngtcp2_pkt_hd& 
 }
 
 
-Connection::Connection(Client& c, const ConnectionID& scid, const Path& path)
-        : endpoint{c}, base_cid{scid}, dest_cid{ConnectionID::random(c.rng)}, path{path} {
+Connection::Connection(Client& c, const ConnectionID& scid, const Path& path, uint16_t tunnel_port)
+        : endpoint{c}, base_cid{scid}, dest_cid{ConnectionID::random(c.rng)}, path{path}, tunnel_port{tunnel_port} {
 
     auto [settings, tparams, cb] = init(c);
 
@@ -438,12 +443,17 @@ Connection::Connection(Client& c, const ConnectionID& scid, const Path& path)
     Debug("Created new client conn ", scid);
 }
 
-
-void Connection::io_ready() {
-    uv_async_send(io_trigger.get());
+Connection::~Connection() {
+    if (wpoll) wpoll->close();
+    if (io_trigger) io_trigger->close();
 }
 
-void Connection::io_callback() {
+
+void Connection::io_ready() {
+    io_trigger->send();
+}
+
+void Connection::on_io_ready() {
     Debug(__func__);
     flush_streams();
     Debug("done ", __func__);
@@ -458,7 +468,7 @@ void Connection::flush_streams() {
     // conn, path, pi, dest, destlen, and ts
     std::optional<uint64_t> ts;
 
-    auto add_stream_data = [&](int64_t stream_id, const ngtcp2_vec* datav, size_t datalen) {
+    auto add_stream_data = [&](StreamID stream_id, const ngtcp2_vec* datav, size_t datalen) {
         std::array<ngtcp2_ssize, 2> result;
         auto& [nwrite, consumed] = result;
         if (!ts) ts = get_timestamp();
@@ -469,7 +479,7 @@ void Connection::flush_streams() {
                 send_buffer.size(),
                 &consumed,
                 NGTCP2_WRITE_STREAM_FLAG_MORE,
-                stream_id,
+                stream_id.id,
                 datav, datalen,
                 *ts);
         return result;
@@ -497,18 +507,20 @@ void Connection::flush_streams() {
         return true;
     };
 
-    for (auto& [stream_id, stream] : streams) {
-        auto bufs = stream.pending();
-        if (!bufs[0]) continue;
+    for (auto& [stream_id, stream_ptr] : streams) {
+        if (!stream_ptr) continue;
+        auto& stream = *stream_ptr;
+        auto [first, second] = stream.pending();
+        if (first.empty()) continue;
         std::array<ngtcp2_vec, 2> vecs;
-        vecs[0].base = const_cast<uint8_t*>(u8data(*bufs[0]));
-        vecs[0].len = bufs[0]->length();
-        if (bufs[1]) {
-            vecs[1].base = const_cast<uint8_t*>(u8data(*bufs[1]));
-            vecs[1].len = bufs[1]->length();
+        vecs[0].base = const_cast<uint8_t*>(u8data(first));
+        vecs[0].len = first.size();
+        if (!second.empty()) {
+            vecs[1].base = const_cast<uint8_t*>(u8data(second));
+            vecs[1].len = second.size();
         }
 
-        auto [nwrite, consumed] = add_stream_data(stream_id, vecs.data(), bufs[1] ? 2 : 1);
+        auto [nwrite, consumed] = add_stream_data(stream_id, vecs.data(), second.empty() ? 1 : 2);
         Debug("add_stream_data for stream ", stream_id, " returned [", nwrite, ",", consumed, "]");
 
         if (nwrite == NGTCP2_ERR_WRITE_MORE) {
@@ -541,7 +553,7 @@ void Connection::flush_streams() {
     // Now try more with stream id -1 and no data: this will take care of initial handshake packets,
     // and should finish off any partially-filled packet from above.
     for (;;) {
-        auto [nwrite, consumed] = add_stream_data(-1, nullptr, 0);
+        auto [nwrite, consumed] = add_stream_data(StreamID{}, nullptr, 0);
         Debug("add_stream_data for non-stream returned [", nwrite, ",", consumed, "]");
         assert(consumed <= 0);
         if (nwrite == NGTCP2_ERR_WRITE_MORE) {

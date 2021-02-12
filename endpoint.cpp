@@ -2,6 +2,7 @@
 #include "server.h"
 #include "client.h"
 #include "log.h"
+#include "uvw/timer.h"
 
 #include <iostream>
 #include <variant>
@@ -18,8 +19,8 @@ extern "C" {
 
 namespace quic {
 
-Endpoint::Endpoint(std::optional<Address> addr, uv_loop_t* loop_)
-        : loop{loop_} {
+Endpoint::Endpoint(std::optional<Address> addr, std::shared_ptr<uvw::Loop> loop_)
+        : loop{std::move(loop_)} {
 
     random_bytes(static_secret.data(), static_secret.size(), rng);
 
@@ -71,25 +72,31 @@ Endpoint::Endpoint(std::optional<Address> addr, uv_loop_t* loop_)
     }
 
     // Let uv do its stuff
-    poll.data = this;
-    uv_poll_init(loop, &poll, fd);
-    uv_poll_start(&poll, UV_READABLE,
-            [](uv_poll_t* handle, int status, int events) {
-                static_cast<Endpoint*>(handle->data)->poll_callback(status, events);
-            });
+    poll = loop->resource<uvw::PollHandle>(fd);
+    poll->on<uvw::PollEvent>([this] (const auto&, auto&) { on_readable(); });
+    poll->start(uvw::PollHandle::Event::READABLE);
 
     // Set up a callback every 250ms to clean up stale sockets, etc.
-    expiry_timer.data = this;
-    uv_timer_init(loop, &expiry_timer);
-    uv_timer_start(&expiry_timer,
-            [](uv_timer_t* handle) { static_cast<Endpoint*>(handle->data)->check_timeouts(); },
-            250/*ms*/, 250/*ms*/);
+    expiry_timer = loop->resource<uvw::TimerHandle>();
+    expiry_timer->on<uvw::TimerEvent>([this] (const auto&, auto&) { check_timeouts(); });
+    expiry_timer->start(250ms, 250ms);
 
     Debug("Created endpoint");
 }
 
-void Endpoint::poll_callback(int status, int events) {
-    Debug("poll callback");
+Endpoint::~Endpoint() {
+    if (poll) poll->close();
+    if (expiry_timer) expiry_timer->close();
+}
+
+int Endpoint::socket_fd() const {
+    // Workaround for https://github.com/skypjack/uvw/issues/236
+    return poll->uvw::Handle<uvw::PollHandle, uv_poll_t>::fd();
+    //return poll->fd();
+}
+
+void Endpoint::on_readable() {
+    Debug("poll callback on readable");
 
 #ifdef LOKINET_HAVE_RECVMMSG
     // NB: recvmmsg is linux-specific but ought to offer some performance benefits

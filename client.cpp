@@ -6,8 +6,8 @@
 
 namespace quic {
 
-Client::Client(Address remote, uv_loop_t* loop_, std::optional<Address> local_)
-        : Endpoint{std::move(local_), loop_} {
+Client::Client(Address remote, std::shared_ptr<uvw::Loop> loop_, uint16_t tunnel_port, std::optional<Address> local_)
+        : Endpoint{std::move(local_), std::move(loop_)} {
 
     // Our UDP socket is now set up, so now we initiate contact with the remote QUIC
     Path path{local, remote};
@@ -48,6 +48,17 @@ Client::Client(Address remote, uv_loop_t* loop_, std::optional<Address> local_)
     }
     else { Debug("Opening bidi stream good"); }
     */
+}
+
+std::shared_ptr<Connection> Client::get_connection() {
+    // A client only has one outgoing connection, so everything in conns should either be a
+    // shared_ptr or weak_ptr to that same outgoing connection so we can just use the first one.
+    auto it = conns.begin();
+    if (it == conns.end())
+        return nullptr;
+    if (auto* wptr = std::get_if<alias_conn_ptr>(&it->second))
+        return wptr->lock();
+    return std::get<primary_conn_ptr>(it->second);
 }
 
 void Client::handle_packet(const Packet& p) {

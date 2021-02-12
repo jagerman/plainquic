@@ -3,6 +3,7 @@
 
 #include <oxenmq/hex.h>
 #include <oxenmq/variant.h>
+#include <uvw/loop.h>
 
 #include <stdexcept>
 #include <tuple>
@@ -10,7 +11,7 @@
 
 namespace quic {
 
-Server::Server(Address listen, uv_loop_t* loop) : Endpoint{std::move(listen), loop} {
+Server::Server(Address listen, std::shared_ptr<uvw::Loop> loop) : Endpoint{std::move(listen), std::move(loop)} {
 }
 
 void Server::handle_packet(const Packet& p) {

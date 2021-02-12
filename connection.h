@@ -14,7 +14,8 @@
 #include <map>
 
 #include <ngtcp2/ngtcp2.h>
-#include <uv.h>
+#include <uvw/async.h>
+#include <uvw/poll.h>
 
 namespace quic {
 
@@ -78,14 +79,6 @@ inline uint64_t get_timestamp(const std::chrono::steady_clock::time_point &t = g
 class Connection : public std::enable_shared_from_this<Connection> {
 private:
     struct connection_deleter { void operator()(ngtcp2_conn* c) const { ngtcp2_conn_del(c); } };
-    struct uv_async_deleter {
-        void operator()(uv_async_t* a) const {
-            // We can't actually do the delete right away because uv_close is asynchronous: tell it
-            // to clean up and then do the actual delete in the callback it invokes when it's done.
-            uv_close(reinterpret_cast<uv_handle_t*>(a), [](uv_handle_t* delete_me) {
-                delete reinterpret_cast<uv_async_t*>(delete_me); });
-        }
-    };
 
     // Packet data storage for a packet we are currently sending
     std::array<std::byte, NGTCP2_MAX_PKTLEN_IPV4> send_buffer{};
@@ -99,7 +92,7 @@ private:
     io_result send();
 
     // Poll for writability; activated if we block while trying to send a packet.
-    uv_poll_t wpoll;
+    std::shared_ptr<uvw::PollHandle> wpoll;
     bool wpoll_active = false;
 
     // Internal base method called invoked during construction to set up common client/server
@@ -107,7 +100,7 @@ private:
     std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> init(Endpoint& ep);
 
     // Event trigger used to queue packet processing for this connection
-    std::unique_ptr<uv_async_t, uv_async_deleter> io_trigger;
+    std::shared_ptr<uvw::AsyncHandle> io_trigger;
 
 public:
     // The endpoint that owns this connection
@@ -141,7 +134,7 @@ public:
 
     // Stores callbacks of active streams, indexed by our local source connection ID that we assign
     // when the connection is initiated.
-    std::map<int64_t, Stream> streams;
+    std::map<StreamID, std::shared_ptr<Stream>> streams;
 
     /// Constructs and initializes a new connection received by a Server
     ///
@@ -163,6 +156,8 @@ public:
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
+    ~Connection();
+
     operator const ngtcp2_conn*() const { return conn.get(); }
     operator ngtcp2_conn*() { return conn.get(); }
 
@@ -177,13 +172,14 @@ public:
     // Called to signal libuv that this connection has stuff to do
     void io_ready();
     // Called (via libuv) when it wants us to do our stuff. Call io_ready() to schedule this.
-    void io_callback();
+    void on_io_ready();
 
     void on_read(bstring_view data);
     int setup_server_crypto_initial();
 
     // Flush any streams with pending data. Note that, depending on available ngtcp2 state, we may
-    // not fully flush all streams.
+    // not fully flush all streams -- some streams can individually block while waiting for
+    // confirmation.
     void flush_streams();
 
     // Asks the endpoint for a new connection ID alias to use for this connection.  cidlen can be

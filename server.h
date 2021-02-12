@@ -7,7 +7,7 @@ namespace quic {
 class Server : public Endpoint {
 
 public:
-    Server(Address listen, uv_loop_t* loop);
+    Server(Address listen, std::shared_ptr<uvw::Loop> loop);
 
     int setup_null_crypto(ngtcp2_conn* conn);
 
