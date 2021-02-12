@@ -102,6 +102,9 @@ private:
     // Event trigger used to queue packet processing for this connection
     std::shared_ptr<uvw::AsyncHandle> io_trigger;
 
+    // The port the client wants to connect to on the server
+    uint16_t tunnel_port = 0;
+
 public:
     // The endpoint that owns this connection
     Endpoint& endpoint;
@@ -148,7 +151,8 @@ public:
     /// \param c - the Client object from which the connection is being made
     /// \param base_cid - the client's source (i.e. local) connection ID, typically random
     /// \param path - the network path to reach the remote
-    Connection(Client& c, const ConnectionID& scid, const Path& path);
+    /// \param tunnel_port - the port that this connection should tunnel to on the remote end
+    Connection(Client& c, const ConnectionID& scid, const Path& path, uint16_t tunnel_port);
 
     // Non-movable, non-copyable:
     Connection(Connection&&) = delete;
@@ -186,9 +190,28 @@ public:
     // used to specify the size of the cid (default is full size).
     ConnectionID make_alias_id(size_t cidlen = ConnectionID::max_size());
 
-    int init_client();
-    bool init_tx_key();
+    // Opens a stream over this connection; when the server receives this it attempts to establish a
+    // TCP connection to the tunnel configured in the connection.  The data callback is invoked as
+    // data is received on this stream.  The close callback is called if the stream is closed
+    // (either by the remote, or locally after a stream->close() call).
+    //
+    // \param data_cb -- callback to invoke when data is received
+    // \param close_cb -- callback to invoke when the connection is closed
+    // \param buffer_size -- the size of the internal buffer to allocate (which determines the
+    // maximum number of unacknoledged bytes that may be in transit at a time).
+    //
+    // Throws a `std::runtime_error` if the stream creation fails (e.g. because the connection has
+    // no free stream capacity).
+    //
+    // Returns a reference to the Stream; this reference must not be held: if you need to access the
+    // stream later it is provided to the callbacks and or can be retrieved by storing the stream's
+    // `.id()` and later passed it into `get_stream()`.
+    std::shared_ptr<Stream> open_stream(Stream::data_callback_t data_cb, Stream::close_callback_t close_cb, size_t buffer_size = 64*1024);
 
+    // Accesses the stream via its StreamID; throws std::out_of_range if the stream doesn't exist.
+    std::shared_ptr<Stream> get_stream(StreamID s);
+
+    int init_client();
     int recv_initial_crypto(std::basic_string_view<uint8_t> data);
     int recv_transport_params(std::basic_string_view<uint8_t> data);
     int send_magic(ngtcp2_crypto_level level);

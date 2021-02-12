@@ -1,74 +1,147 @@
 #include "stream.h"
+#include "connection.h"
+#include "log.h"
+
 #include <cassert>
+#include <iostream>
+
+// We use a single circular buffer with a pointer to the starting byte (denoted `á` or `ŕ`), the
+// overall size, and the number of sent-but-unacked bytes (denoted `a`).  `r` denotes an unsent
+// byte.
+//     [       áaaaaaaarrrr       ]
+//             ^                    == start
+//             ------------         == size (== unacked + unsent bytes)
+//             --------             == unacked_size
+//                         ^        -- the next write starts here
+//      ^^^^^^^            ^^^^^^^  -- unused buffer space
+//
+// we give ngtcp2 direct control over the unacked part of this buffer (it will let us know once the
+// buffered data is no longer needed, i.e. once it is acknowledged by the remote side).
+//
+// The complication is that this buffer wraps, so if we write a bunch of data to the above it would
+// end up looking like this:
+//
+//     [rrr    áaaaaaaarrrrrrrrrrr]
+//
+// This complicates things a bit, especially when returning the buffer to be written because we
+// might have to return two separate string_views (the first would contain [rrrrrrrrrrr] and the
+// second would contain [rrr]).  As soon as we pass those buffer pointers off to ngtcp2 then our
+// buffer looks like:
+//
+//     [aaa    áaaaaaaaaaaaaaaaaaa]
+//
+// Once we get an acknowledgement from the other end of the QUIC connection we can move up B (the
+// beginning of the buffer); for example, suppose it acknowledges the next 10 bytes and then the
+// following 10; we'll have:
+//
+//     [aaa              áaaaaaaaa] -- first 10 acked
+//     [ áa                       ] -- next 10 acked
+//
+// As a special case, if the buffer completely empties (i.e. all data is sent and acked) then we
+// reset the starting bytes to the beginning of the buffer.
 
 namespace quic {
 
-size_t Stream::available() const {
-    return buffer.size() - size;
+std::ostream& operator<<(std::ostream& o, const StreamID& s) {
+    return o << u8"Str❰" << s.id << u8"❱";
 }
 
-bool Stream::try_append(bstring_view data) {
+Stream::Stream(Connection& conn, data_callback_t data_cb, close_callback_t close_cb, size_t buffer_size)
+    : conn{conn}, data_callback{std::move(data_cb)}, close_callback{std::move(close_cb)}, buffer{buffer_size}
+{
+}
+
+bool Stream::append(bstring_view data) {
     size_t avail = available();
     if (avail < data.size())
         return false;
 
+    // When we are appending we have three cases:
+    // - data doesn't fit -- we simply abort (return false, above).
+    // - data fits between the buffer end and `]` -- simply append it and update size
+    // - data is larger -- copy from the end up to `]`, then copy the rest into the beginning of the
+    // buffer (i.e. after `[`).
+
     size_t copy_size = data.size();
+    size_t wpos = (start + size) % buffer.size();
     if (wpos + data.size() > buffer.size()) {
         // We are wrapping
-        size_t prewrap = buffer.size() - wpos;
-        std::copy(data.begin(), data.begin() + prewrap, buffer.begin() + wpos);
-        std::copy(data.begin() + prewrap, data.end(), buffer.begin());
+        auto data_split = data.begin() + (buffer.size() - wpos);
+        std::copy(data.begin(), data_split, buffer.begin() + wpos);
+        std::copy(data_split, data.end(), buffer.begin());
     } else {
+        // No wrap needs, it fits before the end:
         std::copy(data.begin(), data.end(), buffer.begin() + wpos);
     }
-    wpos = (wpos + data.size()) % buffer.size();
     size += data.size();
     return true;
 }
-size_t Stream::append(bstring_view data) {
+size_t Stream::append_any(bstring_view data) {
     size_t avail = available();
     if (data.size() > avail)
         data.remove_suffix(data.size() - avail);
-    [[maybe_unused]] bool appended = try_append(data);
+    [[maybe_unused]] bool appended = append(data);
     assert(appended);
     return data.size();
 }
 
-size_t Stream::unsent() const {
-    if (rpos <= wpos)
-        return wpos - rpos;
-    return buffer.size() + wpos - rpos; // Unsent segment wraps around the end
-}
-
-size_t Stream::unacked() const {
-    if (ack_pos <= wpos)
-        return wpos - ack_pos;
-    // Otherwise ack_pos > wpos which means the unacked part wraps the buffer
-    return buffer.size() + wpos - ack_pos;
-}
-
 void Stream::acknowledge(size_t bytes) {
-    assert(bytes <= size);
-    assert(bytes <= unacked());
-    ack_pos = (ack_pos + bytes) % buffer.size();
+    // Frees bytes; e.g. acknowledge(3) changes:
+    //     [  áaaaaarr  ]  to  [     áaarr  ]
+    //     [aaarr     áa]  to  [ áarr       ]
+    //     [  áaarrr    ]  to  [     ŕrr    ]
+    //     [      áaa   ]  to  [´           ]  (i.e. empty buffer *and* reset start pos)
+    //
+    assert(bytes <= unacked_size && unacked_size <= size);
+
+    unacked_size -= bytes;
     size -= bytes;
+    start = size == 0 ? 0 : (start + bytes) % buffer.size(); // reset start to 0 if the buffer emptied
+    if (!unblocked_callbacks.empty())
+        handle_unblocked();
 }
 
-std::array<std::optional<bstring_view>, 2> Stream::pending() {
-    std::array<std::optional<bstring_view>, 2> bufs;
-    if (rpos < wpos) {
-        bufs[0].emplace(buffer.data() + rpos, wpos - rpos);
-    } else if (rpos > wpos) { // wrapping
-        bufs[0].emplace(buffer.data() + rpos, buffer.size() - rpos);
-        bufs[1].emplace(buffer.data(), wpos);
+std::pair<bstring_view, bstring_view> Stream::pending() {
+    std::pair<bstring_view, bstring_view> bufs;
+    if (size_t rsize = unsent(); rsize > 0) {
+        size_t rpos = (start + unacked_size) % buffer.size();
+        if (size_t rend = rpos + rsize; rend <= buffer.size()) {
+            bufs.first = {buffer.data() + rpos, rsize};
+        } else { // wrapping
+            bufs.first = {buffer.data() + rpos, buffer.size() - rpos};
+            bufs.second = {buffer.data(), rend % buffer.size()};
+        }
     }
     return bufs;
 }
 
+void Stream::when_available(size_t required, unblocked_callback_t unblocked_cb) {
+    unblocked_callbacks.emplace(required, std::move(unblocked_cb));
+    handle_unblocked();
+}
+
+void Stream::handle_unblocked() {
+    while (!unblocked_callbacks.empty() && unblocked_callbacks.front().first <= available()) {
+        unblocked_callbacks.front().second(*this);
+        unblocked_callbacks.pop();
+    }
+}
+
+
 void Stream::wrote(size_t bytes) {
-    assert(bytes <= size);
+    // Called to tell us we sent some bytes off, e.g. wrote(3) changes:
+    //     [  áaarrrrrr  ]  or  [rr     áaar]
+    // to:
+    //     [  áaaaaarrr  ]  or  [aa     áaaa]
     assert(bytes <= unsent());
-    rpos = (rpos + bytes) % buffer.size();
+    unacked_size += bytes;
+}
+
+void Stream::close(bool drop) {
+    Error("FIXME: close via ngtcp2");
+    // FIXME - close via ngtcp2
+    if (drop)
+        data_callback = {};
 }
 
 }

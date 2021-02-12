@@ -13,6 +13,9 @@ Client::Client(Address remote, std::shared_ptr<uvw::Loop> loop_, uint16_t tunnel
     Path path{local, remote};
     Debug("Connecting to ", remote);
 
+    if (tunnel_port == 0)
+        throw std::logic_error{"Cannot tunnel to port 0"};
+
     // TODO: need timers for:
     //
     // - timeout (to disconnect if idle for too longer)
@@ -24,7 +27,7 @@ Client::Client(Address remote, std::shared_ptr<uvw::Loop> loop_, uint16_t tunnel
     // - delay_stream_timer
 
 
-    auto connptr = std::make_shared<Connection>(*this, ConnectionID::random(rng), path);
+    auto connptr = std::make_shared<Connection>(*this, ConnectionID::random(rng), path, tunnel_port);
     auto& conn = *connptr;
     conns.emplace(conn.base_cid, connptr);
 

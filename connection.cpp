@@ -594,6 +594,22 @@ ConnectionID Connection::make_alias_id(size_t cidlen) {
     return endpoint.add_connection_id(*this, cidlen);
 }
 
+std::shared_ptr<Stream> Connection::open_stream(Stream::data_callback_t data_cb, Stream::close_callback_t close_cb, size_t buffer_size) {
+    std::shared_ptr<Stream> stream{new Stream{*this, std::move(data_cb), std::move(close_cb)}};
+    if (int rv = ngtcp2_conn_open_bidi_stream(*this, &stream->stream_id.id, stream.get());
+            rv != 0) {
+        Warn("Creating stream failed: ", ngtcp2_strerror(rv));
+        throw std::runtime_error{"Stream creation failed: "s + ngtcp2_strerror(rv)};
+    }
+    streams[stream->stream_id] = stream;
+
+    return stream;
+}
+
+std::shared_ptr<Stream> Connection::get_stream(StreamID s) {
+    return streams.at(s);
+}
+
 int Connection::init_client() {
     endpoint.null_crypto.client_initial(*this);
 
@@ -645,10 +661,110 @@ void Connection::complete_handshake() {
     ngtcp2_conn_handshake_completed(*this);
 }
 
+// ngtcp2 doesn't expose the varint encoding, but it's fairly simple:
+// 0bXXyyyyyy -- XX indicates the encoded size (00=1, 01=2, 10=4, 11=8) and the rest of the bits
+// (6, 14, 30, or 62) are the number, with bytes in network order for >6-bit values.
+
+// Returns {value, consumed} where consumed is the number of bytes consumed, or 0 on failure.
+static constexpr std::pair<uint64_t, size_t> decode_varint(std::basic_string_view<uint8_t> data) {
+    std::pair<uint64_t, size_t> result = {0, 0};
+    auto& [val, enc_size] = result;
+    if (data.empty()) return result;
+    enc_size = 1 << (data[0] >> 6); // first two bits are log₂ of the length
+    if (data.size() < enc_size) {
+        enc_size = 0;
+        return result;
+    }
+    val = data[0] & 0b0011'1111;
+    for (size_t i = 1; i < enc_size; i++)
+        val = (val << 8) | data[i];
+    return result;
+}
+
+// Encodes an integer; return the bytes and the length (bytes beyond `length` are uninitialized).
+static constexpr std::pair<std::array<uint8_t, 8>, uint8_t> encode_varint(uint64_t val) {
+    assert(val < (1ULL<<62));
+    std::pair<std::array<uint8_t, 8>, uint8_t> result;
+    uint8_t top = 0;
+    uint8_t size = 
+        val < (1ULL << 6) ? 0 :
+        val < (1ULL << 14) ? 1 :
+        val < (1ULL << 30) ? 2 :
+        3;
+    auto& [enc, len] = result;
+    len = 1 << size;
+    for (uint8_t i = 1; i <= len; i++) {
+        enc[len-i] = val & 0xff;
+        val >>= 8;
+    }
+    enc[0] = (enc[0] & 0b00'111111) | (size << 6);
+    enc[0] |= size << 6;
+    return result;
+}
+
+// We add some lokinet-specific data into the transport request and *always* as the first transport
+// parameter, but we do it in a way that the parameter gets ignored by the QUIC protocol, which
+// encodes as {varint[code], varint[length], data}, and requires a code value 31*N+27 (for integer
+// N).  Naturally we use N=42, which gives us 1329=0b10100110001 which encodes in QUIC as 0b01000101
+// 0b00110001 (the first two bits of the first byte give the integer size, and the rest are the
+// value in network order).
+static constexpr uint64_t lokinet_transport_param_N = 42;
+static constexpr auto lokinet_metadata_code_raw = encode_varint(31*lokinet_transport_param_N+27);
+static constexpr std::basic_string_view<uint8_t> lokinet_metadata_code{
+    lokinet_metadata_code_raw.first.data(), lokinet_metadata_code_raw.second};
+static_assert(lokinet_metadata_code.size() == 2 &&
+        lokinet_metadata_code[0] == 0b01000101 && lokinet_metadata_code[1] == 0b00110001);
+
 int Connection::recv_transport_params(std::basic_string_view<uint8_t> data) {
+
+    if (data.substr(0, lokinet_metadata_code.size()) != lokinet_metadata_code) {
+        Warn("transport params did not begin with expected lokinet metadata");
+        return NGTCP2_ERR_TRANSPORT_PARAM;
+    }
+    auto [meta_len, meta_len_bytes] = decode_varint(data.substr(lokinet_metadata_code.size()));
+    if (meta_len_bytes == 0) {
+        Warn("transport params lokinet metadata has truncated size");
+        return NGTCP2_ERR_MALFORMED_TRANSPORT_PARAM;
+    }
+    std::string_view lokinet_metadata{
+            reinterpret_cast<const char*>(data.substr(lokinet_metadata_code.size() + meta_len_bytes).data()),
+            meta_len};
+    Debug("Received bencoded lokinet metadata: ", buffer_printer{lokinet_metadata});
+
+    uint16_t port;
+    try {
+        oxenmq::bt_dict_consumer meta{lokinet_metadata};
+        // '#' contains the port the client wants us to forward to
+        if (!meta.skip_until("#")) {
+            Warn("transport params # (port) is missing but required");
+            return NGTCP2_ERR_TRANSPORT_PARAM;
+        }
+        port = meta.consume_integer<uint16_t>();
+        if (port == 0) {
+            Warn("transport params tunnel port (#) is invalid: 0 is not permitted");
+            return NGTCP2_ERR_TRANSPORT_PARAM;
+        }
+        Debug("decoded lokinet tunnel port = ", port);
+    } catch (const oxenmq::bt_deserialize_invalid& c) {
+        Warn("transport params lokinet metadata is invalid: ", c.what());
+        NGTCP2_ERR_TRANSPORT_PARAM;
+    }
+
+    const bool is_server = ngtcp2_conn_is_server(*this);
+
+    if (is_server) {
+        tunnel_port = port;
+    } else {
+        // Make sure the server reflected the proper port
+        if (tunnel_port != port) {
+            Warn("server returned invalid port; expected ", tunnel_port, ", got ", port);
+            return NGTCP2_ERR_TRANSPORT_PARAM;
+        }
+    }
+
     ngtcp2_transport_params params;
 
-    auto exttype = ngtcp2_conn_is_server(*this)
+    auto exttype = is_server
         ? NGTCP2_TRANSPORT_PARAMS_TYPE_CLIENT_HELLO
         : NGTCP2_TRANSPORT_PARAMS_TYPE_ENCRYPTED_EXTENSIONS;
 
@@ -675,6 +791,13 @@ int Connection::send_magic(ngtcp2_crypto_level level) {
     return ngtcp2_conn_submit_crypto_data(*this, level, handshake_magic.data(), handshake_magic.size());
 }
 
+template <typename String>
+static void copy_and_advance(uint8_t*& buf, const String& s) {
+    static_assert(sizeof(typename String::value_type) == 1, "not a char-compatible type");
+    std::memcpy(buf, s.data(), s.size());
+    buf += s.size();
+}
+
 // Sends transport parameters.  `level` is expected to be INITIAL for clients (which send the
 // transport parameters in the initial packet), or HANDSHAKE for servers.
 int Connection::send_transport_params(ngtcp2_crypto_level level) {
@@ -685,15 +808,32 @@ int Connection::send_transport_params(ngtcp2_crypto_level level) {
     static_assert(NGTCP2_MAX_PKTLEN_IPV4 > NGTCP2_MAX_PKTLEN_IPV6);
     conn_buffer.resize(NGTCP2_MAX_PKTLEN_IPV4);
 
-    auto exttype = ngtcp2_conn_is_server(*this)
+    auto* buf = u8data(conn_buffer);
+    auto* bufend = buf + conn_buffer.size();
+    {
+        // Send our first parameter, the lokinet metadata, in a QUIC-compatible way (by using a
+        // reserved field code that QUIC parsers must ignore); currently we only include the port in
+        // here (from the client to tell the server what it's trying to reach, and reflected from
+        // the server for the client to verify).
+        std::string lokinet_metadata = bt_serialize(oxenmq::bt_dict{
+            {"#", tunnel_port},
+        });
+        copy_and_advance(buf, lokinet_metadata_code);
+        auto [bytes, size] = encode_varint(lokinet_metadata.size());
+        copy_and_advance(buf, std::basic_string_view{bytes.data(), size});
+        copy_and_advance(buf, lokinet_metadata);
+        assert(buf < bufend);
+    }
+
+    const bool is_server = ngtcp2_conn_is_server(*this);
+    auto exttype = is_server
         ? NGTCP2_TRANSPORT_PARAMS_TYPE_ENCRYPTED_EXTENSIONS
         : NGTCP2_TRANSPORT_PARAMS_TYPE_CLIENT_HELLO;
 
-    if (ngtcp2_ssize nwrite = ngtcp2_encode_transport_params(
-                u8data(conn_buffer), conn_buffer.size(), exttype, &tparams);
+    if (ngtcp2_ssize nwrite = ngtcp2_encode_transport_params(buf, bufend - buf, exttype, &tparams);
             nwrite >= 0) {
         assert(nwrite > 0);
-        conn_buffer.resize(nwrite);
+        conn_buffer.resize(buf - u8data(conn_buffer) + nwrite);
     } else {
         conn_buffer.clear();
         return nwrite;
