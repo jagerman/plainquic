@@ -170,13 +170,16 @@ namespace {
         return 0;
     }
 
-    // Do we need acked_stream_data_offset?  (Yes! need it to free the used buffer space)
+    int acked_stream_data_offset(
+            ngtcp2_conn* conn_, int64_t stream_id,
+            uint64_t offset, uint64_t datalen, void* user_data,
+            void* stream_user_data) {
+        return static_cast<Connection*>(user_data)->stream_ack({stream_id}, datalen);
+    }
 
     int stream_open(ngtcp2_conn* conn, int64_t stream_id, void* user_data) {
         Debug("######################", __func__);
-        Error("FIXME UNIMPLEMENTED ", __func__);
-        // FIXME
-        return 0;
+        return static_cast<Connection*>(user_data)->stream_opened({stream_id});
     }
     int stream_close(
             ngtcp2_conn* conn,
@@ -185,9 +188,7 @@ namespace {
             void* user_data,
             void* stream_user_data) {
         Debug("######################", __func__);
-        Error("FIXME UNIMPLEMENTED ", __func__);
-        // FIXME
-        return 0;
+        return static_cast<Connection*>(user_data)->stream_closed({stream_id}, app_error_code);
     }
 
     // (client only)
@@ -329,6 +330,7 @@ std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connectio
     cb.decrypt = decrypt;
     cb.hp_mask = hp_mask;
     cb.recv_stream_data = recv_stream_data;
+    cb.stream_open = stream_open;
     cb.stream_close = stream_close;
     cb.rand = rand;
     cb.get_new_connection_id = get_new_connection_id;
@@ -426,6 +428,8 @@ Connection::Connection(Client& c, const ConnectionID& scid, const Path& path, ui
 
     auto [settings, tparams, cb] = init(c);
 
+    assert(tunnel_port != 0);
+
     cb.client_initial = client_initial;
     cb.recv_retry = recv_retry;
     //cb.extend_max_local_streams_bidi = extend_max_local_streams_bidi;
@@ -468,17 +472,20 @@ void Connection::flush_streams() {
     // conn, path, pi, dest, destlen, and ts
     std::optional<uint64_t> ts;
 
-    auto add_stream_data = [&](StreamID stream_id, const ngtcp2_vec* datav, size_t datalen) {
+    send_pkt_info = {};
+
+    auto add_stream_data = [&](StreamID stream_id, const ngtcp2_vec* datav, size_t datalen, uint32_t flags = 0) {
         std::array<ngtcp2_ssize, 2> result;
         auto& [nwrite, consumed] = result;
         if (!ts) ts = get_timestamp();
 
+        Debug("send_buffer size = ", send_buffer.size());
         nwrite = ngtcp2_conn_writev_stream(
                 conn.get(), &path.path, &send_pkt_info,
                 u8data(send_buffer),
                 send_buffer.size(),
                 &consumed,
-                NGTCP2_WRITE_STREAM_FLAG_MORE,
+                NGTCP2_WRITE_STREAM_FLAG_MORE | flags,
                 stream_id.id,
                 datav, datalen,
                 *ts);
@@ -507,47 +514,65 @@ void Connection::flush_streams() {
         return true;
     };
 
-    for (auto& [stream_id, stream_ptr] : streams) {
-        if (!stream_ptr) continue;
-        auto& stream = *stream_ptr;
-        auto [first, second] = stream.pending();
-        if (first.empty()) continue;
-        std::array<ngtcp2_vec, 2> vecs;
-        vecs[0].base = const_cast<uint8_t*>(u8data(first));
-        vecs[0].len = first.size();
-        if (!second.empty()) {
-            vecs[1].base = const_cast<uint8_t*>(u8data(second));
-            vecs[1].len = second.size();
+    std::list<Stream*> strs;
+    for (auto& [stream_id, stream_ptr] : streams)
+        if (stream_ptr)
+            strs.push_back(stream_ptr.get());
+
+    while (!strs.empty()) {
+        for (auto it = strs.begin(); it != strs.end(); ) {
+            auto& stream = **it;
+            auto [first, second] = stream.pending();
+            if (first.empty()) {
+                it = strs.erase(it);
+                continue;
+            }
+            std::array<ngtcp2_vec, 2> vecs;
+            vecs[0].base = const_cast<uint8_t*>(u8data(first));
+            vecs[0].len = first.size();
+            if (!second.empty()) {
+                vecs[1].base = const_cast<uint8_t*>(u8data(second));
+                vecs[1].len = second.size();
+            } else {
+                vecs[1].len = 0;
+            }
+            Debug("Sending ", vecs[0].len, "+", vecs[1].len, " data for ", stream.id());
+
+            uint32_t extra_flags = 0;
+            if (stream.closing()) {
+                Debug("Sending FIN");
+                extra_flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+            }
+
+            auto [nwrite, consumed] = add_stream_data(stream.id(), vecs.data(), second.empty() ? 1 : 2, extra_flags);
+            Debug("add_stream_data for stream ", stream.id(), " returned [", nwrite, ",", consumed, "]");
+
+            if (nwrite == NGTCP2_ERR_WRITE_MORE) {
+                Debug("consumed ", consumed, " bytes from stream ", stream.id(), " and have space left");
+                stream.wrote(consumed);
+                it = stream.unsent() > 0 ? std::next(it) : strs.erase(it);
+            } else if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+                Debug("cannot add to stream ", stream.id(), " right now: stream is blocked");
+                it = strs.erase(it);
+            } else if (nwrite < 0) {
+                assert(consumed <= 0);
+                Warn("Error writing to stream ", stream.id(), ": ", ngtcp2_strerror(nwrite));
+                // FIXME: close stream instead?
+                it = strs.erase(it);
+            } else if (nwrite == 0) {
+                Debug("Unable to continue stream writing: we are congested");
+                it = strs.erase(it);
+            } else { // nwrite > 0
+                if (consumed >= 0) {
+                    Debug("consumed ", consumed, " bytes from stream ", stream.id());
+                    stream.wrote(consumed);
+                }
+
+                Debug("Sending stream data packet");
+                if (!send_packet(nwrite))
+                    return;
+            }
         }
-
-        auto [nwrite, consumed] = add_stream_data(stream_id, vecs.data(), second.empty() ? 1 : 2);
-        Debug("add_stream_data for stream ", stream_id, " returned [", nwrite, ",", consumed, "]");
-
-        if (nwrite == NGTCP2_ERR_WRITE_MORE) {
-            Debug("consumed ", consumed, " bytes from stream ", stream_id, " and have space left");
-            stream.wrote(consumed);
-            continue;
-        } else if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
-            Debug("cannot add to stream ", stream_id, " right now: stream is blocked");
-            continue;
-        } else if (nwrite < 0) {
-            assert(consumed <= 0);
-            Warn("Error writing to stream ", stream_id, ": ", ngtcp2_strerror(nwrite));
-            return;
-        } else if (nwrite == 0) {
-            // FIXME: 
-            Debug("Unable to continue stream writing: we are congested");
-            return;
-        }
-
-        if (consumed >= 0) {
-            Debug("consumed ", consumed, " bytes from stream ", stream_id);
-            stream.wrote(consumed);
-        }
-
-        Debug("Sending stream data packet");
-        if (!send_packet(nwrite))
-            return;
     }
 
     // Now try more with stream id -1 and no data: this will take care of initial handshake packets,
@@ -563,6 +588,7 @@ void Connection::flush_streams() {
             Warn("Error writing non-stream data: ", ngtcp2_strerror(nwrite));
             return;
         } else if (nwrite == 0) {
+
             // FIXME: Check whether this is actually possible for the -1 streamid?
             Warn("Unable to continue non-stream writing: we are congested");
             return;
@@ -572,6 +598,54 @@ void Connection::flush_streams() {
         if (!send_packet(nwrite))
             return;
     }
+}
+
+int Connection::stream_opened(StreamID id) {
+    Debug("New stream ", id);
+    auto* serv = server();
+    if (!serv) {
+        Warn("We are a client, incoming streams are not accepted");
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+
+    std::shared_ptr<Stream> stream{new Stream{*this, id, endpoint.default_stream_buffer_size}};
+    stream->stream_id = id;
+    bool good = true;
+    if (serv->stream_open_callback)
+        good = serv->stream_open_callback(*serv, *stream, tunnel_port);
+    if (good) {
+        [[maybe_unused]] auto [it, ins] = streams.emplace(id, std::move(stream));
+        assert(ins);
+        Debug("Created new incoming stream ", id);
+    } else {
+        Debug("stream_open_callback returned failure, dropping stream ", id);
+    }
+    return good ? 0 : NGTCP2_ERR_CALLBACK_FAILURE;
+}
+
+int Connection::stream_closed(StreamID id, uint64_t app_code) {
+    Debug(id, " closed with code ", app_code);
+    auto it = streams.find(id);
+    if (it == streams.end())
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    auto& stream = *it->second;
+    const bool was_closing = stream.is_closing;
+    stream.is_closing = true;
+    if (was_closing && stream.close_callback) {
+        Debug("Invoke stream close callback");
+        stream.close_callback(stream, app_code);
+    }
+
+    streams.erase(it);
+    return 0;
+}
+
+int Connection::stream_ack(StreamID id, size_t size) {
+    if (auto it = streams.find(id); it != streams.end()) {
+        it->second->acknowledge(size);
+        return 0;
+    }
+    return NGTCP2_ERR_CALLBACK_FAILURE;
 }
 
 Server* Connection::server() {
@@ -594,8 +668,8 @@ ConnectionID Connection::make_alias_id(size_t cidlen) {
     return endpoint.add_connection_id(*this, cidlen);
 }
 
-std::shared_ptr<Stream> Connection::open_stream(Stream::data_callback_t data_cb, Stream::close_callback_t close_cb, size_t buffer_size) {
-    std::shared_ptr<Stream> stream{new Stream{*this, std::move(data_cb), std::move(close_cb)}};
+std::shared_ptr<Stream> Connection::open_stream(Stream::data_callback_t data_cb, Stream::close_callback_t close_cb) {
+    std::shared_ptr<Stream> stream{new Stream{*this, std::move(data_cb), std::move(close_cb), endpoint.default_stream_buffer_size}};
     if (int rv = ngtcp2_conn_open_bidi_stream(*this, &stream->stream_id.id, stream.get());
             rv != 0) {
         Warn("Creating stream failed: ", ngtcp2_strerror(rv));

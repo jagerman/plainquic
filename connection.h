@@ -186,6 +186,15 @@ public:
     // confirmation.
     void flush_streams();
 
+    // Called when a new stream is opened
+    int stream_opened(StreamID id);
+
+    // Called when a stream is closed
+    int stream_closed(StreamID id, uint64_t app_error_code);
+
+    // Called when stream data has been acknoledged and can be freed
+    int stream_ack(StreamID id, size_t size);
+
     // Asks the endpoint for a new connection ID alias to use for this connection.  cidlen can be
     // used to specify the size of the cid (default is full size).
     ConnectionID make_alias_id(size_t cidlen = ConnectionID::max_size());
@@ -197,8 +206,6 @@ public:
     //
     // \param data_cb -- callback to invoke when data is received
     // \param close_cb -- callback to invoke when the connection is closed
-    // \param buffer_size -- the size of the internal buffer to allocate (which determines the
-    // maximum number of unacknoledged bytes that may be in transit at a time).
     //
     // Throws a `std::runtime_error` if the stream creation fails (e.g. because the connection has
     // no free stream capacity).
@@ -206,7 +213,7 @@ public:
     // Returns a reference to the Stream; this reference must not be held: if you need to access the
     // stream later it is provided to the callbacks and or can be retrieved by storing the stream's
     // `.id()` and later passed it into `get_stream()`.
-    std::shared_ptr<Stream> open_stream(Stream::data_callback_t data_cb, Stream::close_callback_t close_cb, size_t buffer_size = 64*1024);
+    std::shared_ptr<Stream> open_stream(Stream::data_callback_t data_cb, Stream::close_callback_t close_cb);
 
     // Accesses the stream via its StreamID; throws std::out_of_range if the stream doesn't exist.
     std::shared_ptr<Stream> get_stream(StreamID s);

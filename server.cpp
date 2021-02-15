@@ -11,7 +11,9 @@
 
 namespace quic {
 
-Server::Server(Address listen, std::shared_ptr<uvw::Loop> loop) : Endpoint{std::move(listen), std::move(loop)} {
+Server::Server(Address listen, std::shared_ptr<uvw::Loop> loop, stream_open_callback_t stream_open)
+    : Endpoint{std::move(listen), std::move(loop)}, stream_open_callback{std::move(stream_open)}
+{
 }
 
 void Server::handle_packet(const Packet& p) {

@@ -2,12 +2,21 @@
 
 #include "endpoint.h"
 
+#include <functional>
+
 namespace quic {
 
 class Server : public Endpoint {
-
 public:
-    Server(Address listen, std::shared_ptr<uvw::Loop> loop);
+    using stream_open_callback_t = std::function<bool(Server& server, Stream& stream, uint16_t port)>;
+
+    Server(Address listen, std::shared_ptr<uvw::Loop> loop, stream_open_callback_t stream_opened);
+
+    // Stream callback: takes the server, the (just-created) stream, and the connection port.
+    // Returns true if the stream should be allowed or false to reject the stream.  The callback
+    // should set up the data_callback and close_callback on the stream: they will default to null
+    // (which means incoming data will simply be dropped).
+    stream_open_callback_t stream_open_callback;
 
     int setup_null_crypto(ngtcp2_conn* conn);
 

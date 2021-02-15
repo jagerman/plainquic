@@ -91,8 +91,8 @@ Endpoint::~Endpoint() {
 
 int Endpoint::socket_fd() const {
     // Workaround for https://github.com/skypjack/uvw/issues/236
-    return poll->uvw::Handle<uvw::PollHandle, uv_poll_t>::fd();
-    //return poll->fd();
+    //return poll->uvw::Handle<uvw::PollHandle, uv_poll_t>::fd();
+    return poll->fd();
 }
 
 void Endpoint::on_readable() {
@@ -204,7 +204,9 @@ io_result Endpoint::read_packet(const Packet& p, Connection& conn) {
             get_timestamp());
     Debug("Conn state after reading: ", conn.conn->state);
 
-    if (rv != 0)
+    if (rv == 0)
+        conn.io_ready();
+    else
         Warn("read pkt error: ", ngtcp2_strerror(rv));
 
     if (rv == NGTCP2_ERR_DRAINING)

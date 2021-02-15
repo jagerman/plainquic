@@ -51,6 +51,24 @@ Stream::Stream(Connection& conn, data_callback_t data_cb, close_callback_t close
 {
 }
 
+Stream::Stream(Connection& conn, StreamID id, size_t buffer_size)
+    : conn{conn}, stream_id{id}, buffer{buffer_size}
+{
+}
+
+void Stream::set_buffer_size(size_t size) {
+    if (used() != 0)
+        throw std::runtime_error{"Cannot update buffer size while buffer is in use"};
+    if (size == 0)
+        size = 64*1024;
+    else if (size < 2048)
+        size = 2048;
+
+    buffer.resize(size);
+    buffer.shrink_to_fit();
+    start = size = unacked_size = 0;
+}
+
 bool Stream::append(bstring_view data) {
     size_t avail = available();
     if (avail < data.size())
@@ -69,11 +87,15 @@ bool Stream::append(bstring_view data) {
         auto data_split = data.begin() + (buffer.size() - wpos);
         std::copy(data.begin(), data_split, buffer.begin() + wpos);
         std::copy(data_split, data.end(), buffer.begin());
+        Debug("Wrote ", data.size(), " bytes to buffer ranges [", wpos, ",", buffer.size(), ")+[0,", data.end()-data_split, ")");
     } else {
         // No wrap needs, it fits before the end:
         std::copy(data.begin(), data.end(), buffer.begin() + wpos);
+        Debug("Wrote ", data.size(), " bytes to buffer range [", wpos, ",", wpos+data.size(), ")");
     }
     size += data.size();
+    Debug("New stream buffer: ", size, "/", buffer.size(), " bytes beginning at ", start);
+    conn.io_ready();
     return true;
 }
 size_t Stream::append_any(bstring_view data) {
@@ -94,9 +116,11 @@ void Stream::acknowledge(size_t bytes) {
     //
     assert(bytes <= unacked_size && unacked_size <= size);
 
+    Debug("Acked ", bytes, " bytes of ", unacked_size, "/", size, " unacked/total");
+
     unacked_size -= bytes;
     size -= bytes;
-    start = size == 0 ? 0 : (start + bytes) % buffer.size(); // reset start to 0 if the buffer emptied
+    start = size == 0 ? 0 : (start + bytes) % buffer.size(); // reset start to 0 (to reduce wrapping buffers) if empty
     if (!unblocked_callbacks.empty())
         handle_unblocked();
 }
@@ -137,11 +161,26 @@ void Stream::wrote(size_t bytes) {
     unacked_size += bytes;
 }
 
-void Stream::close(bool drop) {
-    Error("FIXME: close via ngtcp2");
-    // FIXME - close via ngtcp2
+void Stream::close(uint64_t app_error_code, bool drop) {
+    Debug("Closing ", stream_id, " with code ", app_error_code);
+
+    if (!is_closing) {
+        is_closing = true;
+        ngtcp2_conn_shutdown_stream(conn, stream_id.id, app_error_code);
+    } else {
+        Debug("Stream is already closing");
+    }
+
     if (drop)
         data_callback = {};
+}
+
+void Stream::data(std::shared_ptr<void> data) {
+    user_data = std::move(data);
+}
+
+void Stream::weak_data(std::weak_ptr<void> data) {
+    user_data = std::move(data);
 }
 
 }

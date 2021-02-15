@@ -202,6 +202,9 @@ public:
     // Makes a deterministic stateless reset token for the given connection ID. Writes it to dest
     // (which must have NGTCP2_STATELESS_RESET_TOKENLEN bytes available).
     void make_stateless_reset_token(const ConnectionID& cid, unsigned char* dest);
+
+    // Default stream buffer size for streams opened through this endpoint.
+    size_t default_stream_buffer_size = 64*1024;
 };
 
 }

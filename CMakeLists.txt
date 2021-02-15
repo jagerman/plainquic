@@ -31,6 +31,7 @@ add_library(quictest
     null-crypto.cpp
     server.cpp
     stream.cpp
+    tunnel.cpp
     )
 
 add_library(ngtcp2 STATIC IMPORTED GLOBAL)

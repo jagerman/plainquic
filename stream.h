@@ -2,10 +2,12 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <queue>
 #include <functional>
 #include <string_view>
 #include <type_traits>
+#include <variant>
 #include <vector>
 
 namespace quic {
@@ -52,8 +54,16 @@ namespace quic {
 // Class for an established stream (a single connection has multiple streams): we have a fixed-sized
 // ring buffer for holding outgoing data, and a callback to invoke on received data.  To construct a
 // Stream call `conn.open_stream()`.
-class Stream {
+class Stream : public std::enable_shared_from_this<Stream> {
 public:
+
+    // Returns the StreamID of this stream
+    const StreamID& id() const { return stream_id; }
+
+    // Sets the size of the buffer.  This may *only* be used if the buffer is currently entirely
+    // empty; otherwise a runtime_error is thrown.  The minimum buffer size is 2048, the default is
+    // 64kiB.
+    void set_buffer_size(size_t size);
 
     // Returns the size of the buffer (including both pending and free space).
     size_t buffer_size() const { return buffer.size(); }
@@ -89,27 +99,53 @@ public:
         return append_any(bstring_view{reinterpret_cast<const std::byte*>(data.data()), data.size()});
     }
 
-    // Starting closing the stream and prevent any more outgoing data from being appended.  If
-    // `drop` is true then the data callback will be cleared and any further incoming data will be
-    // dropped.  Note that pending data may still be sent and received (unless drop=true) for some
-    // time after this call.
-    void close(bool drop = false);
+    // Starting closing the stream and prevent any more outgoing data from being appended.  `code`
+    // is sent to the remote and can be used to communicate a shutdown reason.  If `drop` is true
+    // then the data callback will be cleared and any further incoming data will be dropped.  Note
+    // that pending data may still be sent and received (unless drop=true) for some time after this
+    // call.
+    void close(uint64_t app_error_code = 0, bool drop = false);
 
     // Returns true if this Stream is closing (or already closed).
-    bool closing() const;
+    bool closing() const { return is_closing; }
 
     using data_callback_t = std::function<void(Stream&, bstring_view)>;
-    using close_callback_t = std::function<void(Stream&)>;
+    using close_callback_t = std::function<void(Stream&, std::optional<uint64_t> error_code)>;
     using unblocked_callback_t = std::function<void(Stream&)>;
+
+    // Callback to invoke when we receive some incoming data; there's no particular guarantee on the
+    // size of the data, just that this will always be called in sequential order.
+    data_callback_t data_callback;
+
+    // Callback to invoke when the connection has closed.  If the close was initiated by the remote
+    // then `error_code` will be set to whatever code the remote side provided.
+    close_callback_t close_callback;
 
     // Queues a callback to be invoked when the given amount of space becomes available for writing
     // in the buffer.  If multiple callbacks are queued they are invoked in order, space permitting.
     void when_available(size_t required, unblocked_callback_t unblocked_cb);
 
+    // Lets you stash some arbitrary data in a shared_ptr; this is not used internally.
+    void data(std::shared_ptr<void> data);
+
+    // Variation of data() that holds the pointer in a weak_ptr instead of a shared_ptr.
+    void weak_data(std::weak_ptr<void> data);
+
+    // Retrieves the stashed data, with a static_cast to the desired type.  This is used for
+    // retrieval of both shared or weak data types (if held as a weak_ptr it is lock()ed first).
+    template <typename T>
+    std::shared_ptr<T> data() const {
+        return std::static_pointer_cast<T>(
+            std::holds_alternative<std::shared_ptr<void>>(user_data)
+                ? std::get<std::shared_ptr<void>>(user_data)
+                : std::get<std::weak_ptr<void>>(user_data).lock());
+    }
+
 private:
     friend class Connection;
 
-    Stream(Connection& conn, data_callback_t data_cb, close_callback_t close_cb, size_t buffer_size = 64*1024);
+    Stream(Connection& conn, data_callback_t data_cb, close_callback_t close_cb, size_t buffer_size);
+    Stream(Connection& conn, StreamID id, size_t buffer_size);
 
     // Non-copyable, non-movable; we manage it via a unique_ptr held by its Connection
     Stream(const Stream&) = delete;
@@ -118,13 +154,6 @@ private:
     Stream& operator=(Stream&&) = delete;
 
     Connection& conn;
-
-    // Callback to invoke when we receive some incoming data; there's no particular guarantee on the
-    // size of the data, just that this will always be called in sequential order.
-    data_callback_t data_callback;
-
-    // Callback to invoke when the connection has finished closing.
-    close_callback_t close_callback;
 
     // Callback(s) to invoke once we have the requested amount of space available in the buffer.
     std::queue<std::pair<size_t, unblocked_callback_t>> unblocked_callbacks;
@@ -167,6 +196,8 @@ private:
     size_t size{0};
 
     bool is_closing{false};
+
+    std::variant<std::shared_ptr<void>, std::weak_ptr<void>> user_data;
 };
 
 } // namespace quic

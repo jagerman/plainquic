@@ -88,6 +88,18 @@ template <typename... T> void Debug(T&&...) {}
 #endif
 
 template <typename... T>
+struct Info {
+    Info(T&&... args, const slns::source_location& location = slns::source_location::current()) {
+        std::cerr << "\e[32mNFO";
+        detail::log_print(location, std::forward<T>(args)...);
+        std::cerr << "\e[0m";
+    }
+};
+template <typename... T>
+Info(T&&...) -> Info<T...>;
+
+
+template <typename... T>
 struct Warn {
     Warn(T&&... args, const slns::source_location& location = slns::source_location::current()) {
         std::cerr << "\e[33;1mWRN";
