@@ -139,18 +139,26 @@ std::pair<bstring_view, bstring_view> Stream::pending() {
     return bufs;
 }
 
-void Stream::when_available(size_t required, unblocked_callback_t unblocked_cb) {
-    unblocked_callbacks.emplace(required, std::move(unblocked_cb));
+void Stream::when_available(unblocked_callback_t unblocked_cb) {
+    unblocked_callbacks.push(std::move(unblocked_cb));
     handle_unblocked();
 }
 
 void Stream::handle_unblocked() {
-    while (!unblocked_callbacks.empty() && unblocked_callbacks.front().first <= available()) {
-        unblocked_callbacks.front().second(*this);
-        unblocked_callbacks.pop();
+    while (!unblocked_callbacks.empty() && available() > 0) {
+#ifndef NDEBUG
+        size_t pre_avail = available();
+#endif
+        bool done = unblocked_callbacks.front()(*this);
+        if (done)
+            unblocked_callbacks.pop();
+        else
+            assert(available() < pre_avail);
     }
+    conn.io_ready();
 }
 
+void Stream::io_ready() { conn.io_ready(); }
 
 void Stream::wrote(size_t bytes) {
     // Called to tell us we sent some bytes off, e.g. wrote(3) changes:
@@ -161,18 +169,24 @@ void Stream::wrote(size_t bytes) {
     unacked_size += bytes;
 }
 
-void Stream::close(uint64_t app_error_code, bool drop) {
-    Debug("Closing ", stream_id, " with code ", app_error_code);
+void Stream::close(std::optional<uint64_t> error_code) {
+    Debug("Closing ", stream_id, error_code ? " immediately with code " + std::to_string(*error_code) : " gracefully");
 
-    if (!is_closing) {
-        is_closing = true;
-        ngtcp2_conn_shutdown_stream(conn, stream_id.id, app_error_code);
-    } else {
-        Debug("Stream is already closing");
+    if (is_shutdown)
+        Debug("Stream is already shutting down");
+    else if (error_code) {
+        is_closing = is_shutdown = true;
+        ngtcp2_conn_shutdown_stream(conn, stream_id.id, *error_code);
     }
+    else if (is_closing)
+        Debug("Stream is already closing");
+    else
+        is_closing = true;
 
-    if (drop)
+    if (is_shutdown)
         data_callback = {};
+
+    conn.io_ready();
 }
 
 void Stream::data(std::shared_ptr<void> data) {

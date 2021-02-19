@@ -38,6 +38,9 @@ struct StreamID {
     bool operator>=(const StreamID &s) const { return s.id >= id; }
 };
 
+// Application error code we close with if the data handle throws
+constexpr uint64_t STREAM_EXCEPTION_ERROR_CODE = (1ULL << 62) - 2;
+
 std::ostream& operator<<(std::ostream& o, const StreamID& s);
 } // namespace quic
 
@@ -60,9 +63,9 @@ public:
     // Returns the StreamID of this stream
     const StreamID& id() const { return stream_id; }
 
-    // Sets the size of the buffer.  This may *only* be used if the buffer is currently entirely
-    // empty; otherwise a runtime_error is thrown.  The minimum buffer size is 2048, the default is
-    // 64kiB.
+    // Sets the size of the outgoing data buffer.  This may *only* be used if the buffer is
+    // currently entirely empty; otherwise a runtime_error is thrown.  The minimum buffer size is
+    // 2048, the default is 64kiB.
     void set_buffer_size(size_t size);
 
     // Returns the size of the buffer (including both pending and free space).
@@ -76,7 +79,7 @@ public:
     size_t used() const { return size; }
 
     // Returns the number of bytes of the buffer that have been sent but not yet acknowledged and
-    // thus are still required.  (This includes both sent and unsent bytes).
+    // thus are still required.
     size_t unacked() const { return unacked_size; }
 
     // Returns the number of bytes of the buffer that have not yet been sent.
@@ -99,31 +102,44 @@ public:
         return append_any(bstring_view{reinterpret_cast<const std::byte*>(data.data()), data.size()});
     }
 
-    // Starting closing the stream and prevent any more outgoing data from being appended.  `code`
-    // is sent to the remote and can be used to communicate a shutdown reason.  If `drop` is true
-    // then the data callback will be cleared and any further incoming data will be dropped.  Note
-    // that pending data may still be sent and received (unless drop=true) for some time after this
-    // call.
-    void close(uint64_t app_error_code = 0, bool drop = false);
+    // Starting closing the stream and prevent any more outgoing data from being appended.  If
+    // `error_code` is provided then we close immediately with the given code; if std::nullopt (the
+    // default) we close gracefully by sending a FIN bit.
+    void close(std::optional<uint64_t> error_code = std::nullopt);
 
     // Returns true if this Stream is closing (or already closed).
     bool closing() const { return is_closing; }
 
+    // Callback invoked when data is received
     using data_callback_t = std::function<void(Stream&, bstring_view)>;
+
+    // Callback invoked when the stream is closed
     using close_callback_t = std::function<void(Stream&, std::optional<uint64_t> error_code)>;
-    using unblocked_callback_t = std::function<void(Stream&)>;
+
+    // Callback invoked when free stream buffer space becomes available.  Should return true if the
+    // callback is finished and can be discarded, false if the callback is still needed.  If
+    // returning false then it *must* have filled the stream's outgoing buffer (this is asserted in
+    // a debug build).
+    using unblocked_callback_t = std::function<bool(Stream&)>;
 
     // Callback to invoke when we receive some incoming data; there's no particular guarantee on the
     // size of the data, just that this will always be called in sequential order.
     data_callback_t data_callback;
 
-    // Callback to invoke when the connection has closed.  If the close was initiated by the remote
-    // then `error_code` will be set to whatever code the remote side provided.
+    // Callback to invoke when the connection has closed.  If the close was an abrupt stream close
+    // initiated by the remote then `error_code` will be set to whatever code the remote side
+    // provided; for graceful closing or locally initiated closing the error code will be null.
     close_callback_t close_callback;
 
-    // Queues a callback to be invoked when the given amount of space becomes available for writing
-    // in the buffer.  If multiple callbacks are queued they are invoked in order, space permitting.
-    void when_available(size_t required, unblocked_callback_t unblocked_cb);
+    // Queues a callback to be invoked when space becomes available for writing in the buffer.  The
+    // callback should true if it completed, false if it still needs more buffer space.  If multiple
+    // callbacks are queued they are invoked in order, space permitting.  The stored std::function
+    // will not be moved or copied after being invoked (i.e. if invoked multiple times it will
+    // always be invoked on the same instance).
+    void when_available(unblocked_callback_t unblocked_cb);
+
+    // Calls io_ready() on the stream's connection to trigger sending data
+    void io_ready();
 
     // Lets you stash some arbitrary data in a shared_ptr; this is not used internally.
     void data(std::shared_ptr<void> data);
@@ -156,7 +172,7 @@ private:
     Connection& conn;
 
     // Callback(s) to invoke once we have the requested amount of space available in the buffer.
-    std::queue<std::pair<size_t, unblocked_callback_t>> unblocked_callbacks;
+    std::queue<unblocked_callback_t> unblocked_callbacks;
     void handle_unblocked(); // Processes the above if space is available
 
     // Called to advance the number of acknowledged bytes (freeing up that space in the buffer for
@@ -195,7 +211,10 @@ private:
     // description is ignoring the circularity of the buffer).
     size_t size{0};
 
+    bool is_new{true};
     bool is_closing{false};
+    bool sent_fin{false};
+    bool is_shutdown{false};
 
     std::variant<std::shared_ptr<void>, std::weak_ptr<void>> user_data;
 };

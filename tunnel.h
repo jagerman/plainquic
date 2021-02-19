@@ -4,6 +4,7 @@
 #include "log.h"
 #include "uvw/tcp.h"
 
+#include <charconv>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -12,44 +13,42 @@
 
 namespace tunnel {
 
-enum class tunnel_error : uint64_t {
-    TCP_NONE = 0,
-    TCP_FAILED = 1,
-    TCP_CLOSED = 2,
-};
-
-constexpr uint64_t code(tunnel_error e) { return static_cast<uint64_t>(e); }
-
-constexpr std::string_view tunnel_error_str(tunnel_error code) {
-    using namespace std::literals;
-    switch (code) {
-        case tunnel_error::TCP_NONE: return "(no error)"sv;
-        case tunnel_error::TCP_FAILED: return "Remote TCP connection failed"sv;
-        case tunnel_error::TCP_CLOSED: return "Remote TCP connection closed"sv;
-        default: return "(unknown error)"sv;
-    }
-}
-
-constexpr std::string_view tunnel_error_str(uint64_t code) {
-    return tunnel_error_str(tunnel_error{code});
-}
+// The server sends back a 0x00 to signal that the remote TCP connection was established and that it
+// is now accepting stream data; the client is not allowed to send any other data down the stream
+// until this comes back (any data sent down the stream before then is discarded.)
+inline constexpr std::byte CONNECT_INIT{0x00};
+// QUIC application error codes we sent on failures:
+// Failure to establish an initial connection:
+inline constexpr uint64_t ERROR_CONNECT{0x5471907};
+// Error if we receive something other than CONNECT_INIT as the initial stream data from the server
+inline constexpr uint64_t ERROR_BAD_INIT{0x5471908};
+// Close error code sent if we get an error on the TCP socket (other than an initial connect
+// failure)
+inline constexpr uint64_t ERROR_TCP{0x5471909};
 
 // Callbacks for network events.  The uvw::TCPHandle client must contain a shared pointer to the
 // associated quic::Stream in its data, and the quic::Stream must contain a weak pointer to the
 // uvw::TCPHandle.
 
 // Callback when we receive data to go out over lokinet, i.e. read from the local TCP socket
-void on_outgoing_data(const uvw::DataEvent& event, uvw::TCPHandle& client);
+void on_outgoing_data(uvw::DataEvent& event, uvw::TCPHandle& client);
 
 // Callback when we receive data from lokinet to write to the local TCP socket
 void on_incoming_data(quic::Stream& stream, quic::bstring_view bdata);
 
-// Callback when the stream closes; if the remote lokinet closed it then code will be set to the
-// application error code it provided.
-void on_remote_close(quic::Stream& s, std::optional<uint64_t> code);
+// Callback to handle and discard the first incoming 0x00 byte that initiates the stream
+void on_init_incoming_data(quic::Stream& stream, quic::bstring_view bdata);
 
 // Creates a new tcp handle that forwards incoming data/errors/closes into appropriate actions on
 // the given quic stream.
 void install_stream_forwarding(uvw::TCPHandle& tcp, quic::Stream& stream);
+
+template <typename Int>
+bool parse_int(std::string_view arg, Int& i) {
+    const char* begin = arg.data();
+    const char* end = begin + arg.size();
+    auto [p, ec] = std::from_chars(begin, end, i);
+    return ec == std::errc{} && p == end;
+}
 
 }

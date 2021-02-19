@@ -46,8 +46,8 @@ pkg_check_modules(SODIUM REQUIRED libsodium>=1.0.17 IMPORTED_TARGET)
 target_link_libraries(quictest PUBLIC ngtcp2 PkgConfig::LIBUV PkgConfig::OXENMQ PkgConfig::SODIUM)
 target_include_directories(quictest PUBLIC uvw/src)
 
-add_executable(echo-server echo-server.cpp)
-add_executable(echo-client echo-client.cpp)
+add_executable(tunnel-server tunnel-server.cpp)
+add_executable(tunnel-client tunnel-client.cpp)
 
-target_link_libraries(echo-server quictest)
-target_link_libraries(echo-client quictest)
+target_link_libraries(tunnel-server quictest)
+target_link_libraries(tunnel-client quictest)

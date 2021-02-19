@@ -24,6 +24,12 @@ namespace quic {
 constexpr const std::array<uint8_t, 8> handshake_magic_bytes{'l','o','k','i','n','e','t',0x01};
 constexpr std::basic_string_view<uint8_t> handshake_magic{handshake_magic_bytes.data(), handshake_magic_bytes.size()};
 
+// Flow control window sizes for a buffer and individual streams:
+constexpr uint64_t CONNECTION_BUFFER = 1024*1024;
+constexpr uint64_t STREAM_BUFFER = 64*1024;
+// Max number of simultaneous streams we support on a connection
+constexpr uint64_t STREAM_LIMIT = 100;
+
 using bstring_view = std::basic_string_view<std::byte>;
 
 class Endpoint;
@@ -189,8 +195,11 @@ public:
     // Called when a new stream is opened
     int stream_opened(StreamID id);
 
-    // Called when a stream is closed
-    int stream_closed(StreamID id, uint64_t app_error_code);
+    // Called when data is received for a stream
+    int stream_receive(StreamID id, bstring_view data, bool fin);
+
+    // Called when a stream is closed/reset
+    int stream_reset(StreamID id, uint64_t app_error_code);
 
     // Called when stream data has been acknoledged and can be freed
     int stream_ack(StreamID id, size_t size);
@@ -210,13 +219,12 @@ public:
     // Throws a `std::runtime_error` if the stream creation fails (e.g. because the connection has
     // no free stream capacity).
     //
-    // Returns a reference to the Stream; this reference must not be held: if you need to access the
-    // stream later it is provided to the callbacks and or can be retrieved by storing the stream's
-    // `.id()` and later passed it into `get_stream()`.
-    std::shared_ptr<Stream> open_stream(Stream::data_callback_t data_cb, Stream::close_callback_t close_cb);
+    // Returns a const reference to the stored Stream shared_ptr (so that the caller can decide
+    // whether they want a copy or not).
+    const std::shared_ptr<Stream>& open_stream(Stream::data_callback_t data_cb, Stream::close_callback_t close_cb);
 
     // Accesses the stream via its StreamID; throws std::out_of_range if the stream doesn't exist.
-    std::shared_ptr<Stream> get_stream(StreamID s);
+    const std::shared_ptr<Stream>& get_stream(StreamID s) const;
 
     int init_client();
     int recv_initial_crypto(std::basic_string_view<uint8_t> data);

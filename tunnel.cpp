@@ -1,9 +1,12 @@
 #include "tunnel.h"
+#include "stream.h"
 #include "uvw/tcp.h"
 
 namespace tunnel {
 
-void on_outgoing_data(const uvw::DataEvent& event, uvw::TCPHandle& client) {
+// Takes data from the tcp connection and pushes it down the quic tunnel
+void on_outgoing_data(uvw::DataEvent& event, uvw::TCPHandle& client) {
+    quic::Warn("on outgoing data");
     auto stream = client.data<quic::Stream>();
     assert(stream);
     std::string_view data{event.data.get(), event.length};
@@ -17,17 +20,31 @@ void on_outgoing_data(const uvw::DataEvent& event, uvw::TCPHandle& client) {
         quic::Debug("quic tunnel is congested (wrote ", wrote, " of ", data.size(), " bytes; pausing local tcp connection reads");
         client.stop();
         data.remove_prefix(wrote);
-        stream->when_available(data.size(), [client = client.shared_from_this(), overflow = std::string{data}](quic::Stream& s) {
+        stream->when_available([
+                client=client.shared_from_this(),
+                // Steal the unique_ptr<char[]> from DataEvent (but have to use a shared_ptr because
+                // of std::function).
+                buffer=std::shared_ptr<char[]>(event.data.release()),
+                data=std::move(data)
+        ](quic::Stream& s) mutable {
+            if (auto wrote = s.append_any(data); wrote < data.size()) {
+                quic::Debug("quic tunnel is partially unstuck (wrote ", wrote, " of ", data.size(), " remaining bytes)");
+                data.remove_prefix(wrote);
+                return false; // Not done.
+            }
+
             quic::Debug("quic tunnel is no longer congested; resuming tcp connection reading");
-            [[maybe_unused]] bool appended = s.append(overflow);
-            assert(appended);
             client->read();
+            return true;
         });
     } else {
         quic::Debug("Sent ", wrote, " bytes");
     }
 }
+
+// Received data from the quic tunnel and sends it to the TCP connection
 void on_incoming_data(quic::Stream& stream, quic::bstring_view bdata) {
+    quic::Error("on incoming data");
     auto tcp = stream.data<uvw::TCPHandle>();
     assert(tcp);
     std::string_view data{reinterpret_cast<const char*>(bdata.data()), bdata.size()};
@@ -40,23 +57,14 @@ void on_incoming_data(quic::Stream& stream, quic::bstring_view bdata) {
     // Try first to write immediately from the existing buffer to avoid needing an
     // allocation and copy:
     auto written = tcp->tryWrite(const_cast<char*>(data.data()), data.size());
-    if (written < data.size())
+    if (written < data.size()) {
         data.remove_prefix(written);
 
-    auto wdata = std::make_unique<char[]>(data.size());
-    std::copy(data.begin(), data.end(), wdata.get());
-    tcp->write(std::move(wdata), data.size());
+        auto wdata = std::make_unique<char[]>(data.size());
+        std::copy(data.begin(), data.end(), wdata.get());
+        tcp->write(std::move(wdata), data.size());
+    }
 }
-
-
-void on_remote_close(quic::Stream& s, std::optional<uint64_t> code) {
-    auto tcp = s.data<uvw::TCPHandle>();
-    assert(tcp); // FIXME - maybe the TCPHandle could have gone away first?
-    quic::Debug("lokinet side closed stream (", tunnel_error_str(code.value_or(0)), "); closing ",
-            tcp->peer().ip, ":", tcp->peer().port);
-    s.close(0, true);
-}
-
 
 void install_stream_forwarding(uvw::TCPHandle& tcp, quic::Stream& stream) {
     tcp.data(stream.shared_from_this());
@@ -64,22 +72,24 @@ void install_stream_forwarding(uvw::TCPHandle& tcp, quic::Stream& stream) {
 
     tcp.on<uvw::CloseEvent>([](auto&, uvw::TCPHandle& c) {
         // This fires sometime after we call `close()` to signal that the close is done.
-        quic::Debug("Connection with ", c.peer().ip, ":", c.peer().port, " closed directly, shutting down quic stream");
-        c.data<quic::Stream>()->close(code(tunnel::tunnel_error::TCP_CLOSED));
+        quic::Error("Connection with ", c.peer().ip, ":", c.peer().port, " closed directly, closing quic stream");
+        c.data<quic::Stream>()->close();
     });
     tcp.on<uvw::EndEvent>([](auto&, uvw::TCPHandle& c) {
         // This fires on eof, most likely because the other side of the TCP connection closed it.
-        quic::Debug("EOF on connection with ", c.peer().ip, ":", c.peer().port, ", shutting down quic stream");
-        c.data<quic::Stream>()->close(code(tunnel::tunnel_error::TCP_CLOSED));
+        quic::Error("EOF on connection with ", c.peer().ip, ":", c.peer().port, ", closing quic stream");
+        c.data<quic::Stream>()->close();
     });
-    tcp.on<uvw::ErrorEvent>([](const uvw::ErrorEvent &, uvw::TCPHandle &tcp) {
+    tcp.on<uvw::ErrorEvent>([](const uvw::ErrorEvent &e, uvw::TCPHandle &tcp) {
+        quic::Error("ErrorEvent[", e.name(), ": ", e.what(), "] on connection with ", tcp.peer().ip, ":", tcp.peer().port, ", shutting down quic stream");
         // Failed to open connection, so close the quic stream
         auto stream = tcp.data<quic::Stream>();
         if (stream)
-            stream->close(code(tunnel::tunnel_error::TCP_FAILED));
+            stream->close(ERROR_TCP);
         tcp.close();
     });
     tcp.on<uvw::DataEvent>(tunnel::on_outgoing_data);
+    stream.data_callback = on_incoming_data;
 }
 
 }
