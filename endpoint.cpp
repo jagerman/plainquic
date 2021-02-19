@@ -90,8 +90,6 @@ Endpoint::~Endpoint() {
 }
 
 int Endpoint::socket_fd() const {
-    // Workaround for https://github.com/skypjack/uvw/issues/236
-    //return poll->uvw::Handle<uvw::PollHandle, uv_poll_t>::fd();
     return poll->fd();
 }
 
