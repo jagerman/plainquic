@@ -205,6 +205,8 @@ public:
 
     // Default stream buffer size for streams opened through this endpoint.
     size_t default_stream_buffer_size = 64*1024;
+
+    uvw::Loop& get_loop() { return *loop; }
 };
 
 }

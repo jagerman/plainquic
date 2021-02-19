@@ -103,7 +103,7 @@ private:
 
     // Internal base method called invoked during construction to set up common client/server
     // settings.  dest_cid and path must already be set.
-    std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> init(Endpoint& ep);
+    std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> init();
 
     // Event trigger used to queue packet processing for this connection
     std::shared_ptr<uvw::AsyncHandle> io_trigger;

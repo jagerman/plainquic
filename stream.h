@@ -10,6 +10,8 @@
 #include <variant>
 #include <vector>
 
+#include <uvw/async.h>
+
 namespace quic {
 
 class Connection;
@@ -136,10 +138,17 @@ public:
     // callbacks are queued they are invoked in order, space permitting.  The stored std::function
     // will not be moved or copied after being invoked (i.e. if invoked multiple times it will
     // always be invoked on the same instance).
+    //
+    // Available callbacks should only be used when the buffer is full, typically immediately after
+    // an `append_any` call that returns less than the full write.  Similarly a false return from an
+    // unblock function (which keeps the callback alive) should satisfy the same condition.
     void when_available(unblocked_callback_t unblocked_cb);
 
-    // Calls io_ready() on the stream's connection to trigger sending data
+    // Calls io_ready() on the stream's connection to scheduling sending outbound data
     void io_ready();
+
+    // Schedules processing of the "when_available" callbacks
+    void available_ready();
 
     // Lets you stash some arbitrary data in a shared_ptr; this is not used internally.
     void data(std::shared_ptr<void> data);
@@ -160,7 +169,7 @@ public:
 private:
     friend class Connection;
 
-    Stream(Connection& conn, data_callback_t data_cb, close_callback_t close_cb, size_t buffer_size);
+    Stream(Connection& conn, data_callback_t data_cb, close_callback_t close_cb, size_t buffer_size, StreamID id = {-1});
     Stream(Connection& conn, StreamID id, size_t buffer_size);
 
     // Non-copyable, non-movable; we manage it via a unique_ptr held by its Connection
@@ -215,6 +224,10 @@ private:
     bool is_closing{false};
     bool sent_fin{false};
     bool is_shutdown{false};
+
+    // Async trigger we use to schedule when_available callbacks (so that we can make them happen in
+    // batches rather than after each and every packet ack).
+    std::shared_ptr<uvw::AsyncHandle> avail_trigger;
 
     std::variant<std::shared_ptr<void>, std::weak_ptr<void>> user_data;
 };

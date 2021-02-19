@@ -308,9 +308,8 @@ io_result Connection::send() {
 }
 
 
-std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connection::init(Endpoint& ep) {
-    Debug("loop: ", ep.loop);
-    io_trigger = ep.loop->resource<uvw::AsyncHandle>();
+std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connection::init() {
+    io_trigger = endpoint.loop->resource<uvw::AsyncHandle>();
     io_trigger->on<uvw::AsyncEvent>([this] (auto&, auto&) { on_io_ready(); });
 
     auto result = std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks>{};
@@ -362,7 +361,7 @@ std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connectio
 Connection::Connection(Server& s, const ConnectionID& base_cid_, ngtcp2_pkt_hd& header, const Path& path)
         : endpoint{s}, base_cid{base_cid_}, dest_cid{header.scid}, path{path} {
 
-    auto [settings, tparams, cb] = init(s);
+    auto [settings, tparams, cb] = init();
 
     cb.recv_client_initial = recv_client_initial;
 
@@ -417,7 +416,7 @@ Connection::Connection(Server& s, const ConnectionID& base_cid_, ngtcp2_pkt_hd& 
 Connection::Connection(Client& c, const ConnectionID& scid, const Path& path, uint16_t tunnel_port)
         : endpoint{c}, base_cid{scid}, dest_cid{ConnectionID::random(c.rng)}, path{path}, tunnel_port{tunnel_port} {
 
-    auto [settings, tparams, cb] = init(c);
+    auto [settings, tparams, cb] = init();
 
     assert(tunnel_port != 0);
 

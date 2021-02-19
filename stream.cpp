@@ -1,6 +1,8 @@
 #include "stream.h"
 #include "connection.h"
+#include "endpoint.h"
 #include "log.h"
+#include "uvw/async.h"
 
 #include <cassert>
 #include <iostream>
@@ -46,13 +48,19 @@ std::ostream& operator<<(std::ostream& o, const StreamID& s) {
     return o << u8"Str❰" << s.id << u8"❱";
 }
 
-Stream::Stream(Connection& conn, data_callback_t data_cb, close_callback_t close_cb, size_t buffer_size)
-    : conn{conn}, data_callback{std::move(data_cb)}, close_callback{std::move(close_cb)}, buffer{buffer_size}
+Stream::Stream(Connection& conn, data_callback_t data_cb, close_callback_t close_cb, size_t buffer_size, StreamID id) :
+    conn{conn},
+    stream_id{std::move(id)},
+    data_callback{std::move(data_cb)},
+    close_callback{std::move(close_cb)},
+    buffer{buffer_size},
+    avail_trigger{conn.endpoint.get_loop().resource<uvw::AsyncHandle>()}
 {
+    avail_trigger->on<uvw::AsyncEvent>([this] (auto&, auto&) { handle_unblocked(); });
 }
 
 Stream::Stream(Connection& conn, StreamID id, size_t buffer_size)
-    : conn{conn}, stream_id{id}, buffer{buffer_size}
+    : Stream{conn, nullptr, nullptr, buffer_size, std::move(id)}
 {
 }
 
@@ -122,7 +130,7 @@ void Stream::acknowledge(size_t bytes) {
     size -= bytes;
     start = size == 0 ? 0 : (start + bytes) % buffer.size(); // reset start to 0 (to reduce wrapping buffers) if empty
     if (!unblocked_callbacks.empty())
-        handle_unblocked();
+        available_ready();
 }
 
 std::pair<bstring_view, bstring_view> Stream::pending() {
@@ -140,25 +148,23 @@ std::pair<bstring_view, bstring_view> Stream::pending() {
 }
 
 void Stream::when_available(unblocked_callback_t unblocked_cb) {
+    assert(available() == 0);
     unblocked_callbacks.push(std::move(unblocked_cb));
-    handle_unblocked();
 }
 
 void Stream::handle_unblocked() {
     while (!unblocked_callbacks.empty() && available() > 0) {
-#ifndef NDEBUG
-        size_t pre_avail = available();
-#endif
-        bool done = unblocked_callbacks.front()(*this);
-        if (done)
+        if (unblocked_callbacks.front()(*this))
             unblocked_callbacks.pop();
         else
-            assert(available() < pre_avail);
+            assert(available() == 0);
     }
     conn.io_ready();
 }
 
 void Stream::io_ready() { conn.io_ready(); }
+
+void Stream::available_ready() { avail_trigger->send(); }
 
 void Stream::wrote(size_t bytes) {
     // Called to tell us we sent some bytes off, e.g. wrote(3) changes:
