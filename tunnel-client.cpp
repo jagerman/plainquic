@@ -91,6 +91,7 @@ int main(int argc, char *argv[]) {
         loop,
         dest_port // tunnel destination port
         );
+    tunnel_client->default_stream_buffer_size = 0; // We steal uvw's provided buffers
     quic::Debug("Initialized client");
 
     // Start listening for TCP connections:

@@ -20,7 +20,8 @@
 #include <uvw/poll.h>
 #include <uvw/timer.h>
 
-#if defined(__linux__) && !defined(NO_RECVMMSG)
+// True if we support recvmmsg/sendmmsg
+#if defined(__linux__) && !defined(LOKINET_NO_RECVMMSG)
 #  define LOKINET_HAVE_RECVMMSG
 #endif
 

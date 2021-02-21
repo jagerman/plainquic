@@ -26,6 +26,10 @@ inline constexpr uint64_t ERROR_BAD_INIT{0x5471908};
 // failure)
 inline constexpr uint64_t ERROR_TCP{0x5471909};
 
+// We pause reading from the local TCP socket if we have more than this amount of outstanding
+// unacked data in the quic tunnel, then resume once it drops below this.
+inline constexpr size_t PAUSE_SIZE = 64*1024;
+
 // Callbacks for network events.  The uvw::TCPHandle client must contain a shared pointer to the
 // associated quic::Stream in its data, and the quic::Stream must contain a weak pointer to the
 // uvw::TCPHandle.

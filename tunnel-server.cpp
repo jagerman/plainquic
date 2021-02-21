@@ -91,7 +91,8 @@ int main(int argc, char *argv[]) {
                 tcp.erase(error_handler);
                 tunnel::install_stream_forwarding(tcp, *stream);
                 assert(stream->used() == 0);
-                stream->append(quic::bstring_view{&tunnel::CONNECT_INIT, 1});
+
+                stream->append_buffer(new std::byte[1]{tunnel::CONNECT_INIT}, 1);
                 tcp.read();
             });
 
@@ -100,6 +101,7 @@ int main(int argc, char *argv[]) {
             return true;
         }
     };
+    s.default_stream_buffer_size = 0; // We steal uvw's provided buffers
     quic::Debug("Initialized server");
     std::cout << "Listening on localhost:" << listen_port << " with tunnel(s) to localhost port(s):";
     if (allowed_ports.empty())

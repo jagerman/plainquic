@@ -1,4 +1,5 @@
 #include "tunnel.h"
+#include "log.h"
 #include "stream.h"
 #include "uvw/tcp.h"
 
@@ -11,33 +12,22 @@ void on_outgoing_data(uvw::DataEvent& event, uvw::TCPHandle& client) {
     std::string_view data{event.data.get(), event.length};
     auto peer = client.peer();
     quic::Debug(peer.ip, ":", peer.port, " → lokinet ", quic::buffer_printer{data});
-    if (auto wrote = stream->append_any(data); wrote < data.size()) {
-        // This gets complicated: we've received some data to forward but the stream's
-        // internal buffer is full of unacknowledged data.  We have to basically pause the
-        // local socket until the situation improves, and keep a sort of "overflow" buffer
-        // here to be reinserted once the stream space frees up.
-        quic::Debug("quic tunnel is congested (wrote ", wrote, " of ", data.size(), " bytes; pausing local tcp connection reads");
+    // Steal the buffer from the DataEvent's unique_ptr<char[]>:
+    stream->append_buffer(reinterpret_cast<const std::byte*>(event.data.release()), event.length);
+    if (stream->used() >= PAUSE_SIZE) {
+        quic::Debug("quic tunnel is congested (have ", stream->used(), " bytes in flight); pausing local tcp connection reads");
         client.stop();
-        data.remove_prefix(wrote);
-        stream->when_available([
-                client=client.shared_from_this(),
-                // Steal the unique_ptr<char[]> from DataEvent (but have to use a shared_ptr because
-                // of std::function).
-                buffer=std::shared_ptr<char[]>(event.data.release()),
-                data=std::move(data)
-        ](quic::Stream& s) mutable {
-            if (auto wrote = s.append_any(data); wrote < data.size()) {
-                quic::Debug("quic tunnel is partially unstuck (wrote ", wrote, " of ", data.size(), " remaining bytes)");
-                data.remove_prefix(wrote);
-                return false; // Not done.
+        stream->when_available([](quic::Stream& s) {
+            auto client = s.data<uvw::TCPHandle>();
+            if (s.used() < PAUSE_SIZE) {
+                quic::Debug("quic tunnel is no longer congested; resuming tcp connection reading");
+                client->read();
+                return true;
             }
-
-            quic::Debug("quic tunnel is no longer congested; resuming tcp connection reading");
-            client->read();
-            return true;
+            return false;
         });
     } else {
-        quic::Debug("Sent ", wrote, " bytes");
+        quic::Debug("Queued ", event.length, " bytes");
     }
 }
 

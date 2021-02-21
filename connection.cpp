@@ -12,6 +12,7 @@
 #include "uvw/poll.h"
 #include "uvw/timer.h"
 
+#include <iterator>
 #include <oxenmq/hex.h>
 #include <oxenmq/bt_serialize.h>
 
@@ -516,19 +517,27 @@ void Connection::flush_streams() {
     while (!strs.empty() && stream_packets < 10) {
         for (auto it = strs.begin(); it != strs.end(); ) {
             auto& stream = **it;
-            auto [first, second] = stream.pending();
+            auto bufs = stream.pending();
             if (stream.is_shutdown ||
-                    (first.empty() && !stream.is_new && !(stream.is_closing && !stream.sent_fin))) {
+                    (bufs.empty() && !stream.is_new && !(stream.is_closing && !stream.sent_fin))) {
                 it = strs.erase(it);
                 continue;
             }
-            std::array<ngtcp2_vec, 2> vecs;
-            vecs[0].base = const_cast<uint8_t*>(u8data(first));
-            vecs[0].len = first.size();
-            vecs[1].base = const_cast<uint8_t*>(u8data(second));
-            vecs[1].len = second.size();
-            size_t vecs_size = first.empty() ? 0 : second.empty() ? 1 : 2;
-            Debug("Sending ", vecs[0].len, "+", vecs[1].len, " data for ", stream.id());
+            std::vector<ngtcp2_vec> vecs;
+            vecs.reserve(bufs.size());
+            std::transform(bufs.begin(), bufs.end(), std::back_inserter(vecs),
+                    [](const auto& buf) { return ngtcp2_vec{const_cast<uint8_t*>(u8data(buf)), buf.size()}; });
+
+#ifndef NDEBUG
+            {
+                std::string buf_sizes;
+                for (auto& b : bufs) {
+                    if (!buf_sizes.empty()) buf_sizes += '+';
+                    buf_sizes += std::to_string(b.size());
+                }
+                Debug("Sending ", buf_sizes.empty() ? "no" : buf_sizes, " data for ", stream.id());
+            }
+#endif
 
             uint32_t extra_flags = 0;
             if (stream.is_closing && !stream.sent_fin) {
@@ -539,7 +548,7 @@ void Connection::flush_streams() {
                 stream.is_new = false;
             }
 
-            auto [nwrite, consumed] = add_stream_data(stream.id(), vecs.data(), vecs_size, extra_flags);
+            auto [nwrite, consumed] = add_stream_data(stream.id(), vecs.data(), vecs.size(), extra_flags);
             Debug("add_stream_data for stream ", stream.id(), " returned [", nwrite, ",", consumed, "]");
 
             if (nwrite > 0) {

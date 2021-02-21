@@ -67,9 +67,7 @@ Stream::Stream(Connection& conn, StreamID id, size_t buffer_size)
 void Stream::set_buffer_size(size_t size) {
     if (used() != 0)
         throw std::runtime_error{"Cannot update buffer size while buffer is in use"};
-    if (size == 0)
-        size = 64*1024;
-    else if (size < 2048)
+    if (size > 0 && size < 2048)
         size = 2048;
 
     buffer.resize(size);
@@ -77,9 +75,16 @@ void Stream::set_buffer_size(size_t size) {
     start = size = unacked_size = 0;
 }
 
+size_t Stream::buffer_size() const {
+    return buffer.empty()
+        ? size + start // start is the acked amount of the first buffer
+        : buffer.size();
+}
+
 bool Stream::append(bstring_view data) {
-    size_t avail = available();
-    if (avail < data.size())
+    assert(!buffer.empty());
+
+    if (data.size() > available())
         return false;
 
     // When we are appending we have three cases:
@@ -107,12 +112,18 @@ bool Stream::append(bstring_view data) {
     return true;
 }
 size_t Stream::append_any(bstring_view data) {
-    size_t avail = available();
-    if (data.size() > avail)
+    if (size_t avail = available(); data.size() > avail)
         data.remove_suffix(data.size() - avail);
     [[maybe_unused]] bool appended = append(data);
     assert(appended);
     return data.size();
+}
+
+void Stream::append_buffer(const std::byte* buffer, size_t length) {
+    assert(this->buffer.empty());
+    user_buffers.emplace_back(buffer, length);
+    size += length;
+    conn.io_ready();
 }
 
 void Stream::acknowledge(size_t bytes) {
@@ -128,21 +139,61 @@ void Stream::acknowledge(size_t bytes) {
 
     unacked_size -= bytes;
     size -= bytes;
-    start = size == 0 ? 0 : (start + bytes) % buffer.size(); // reset start to 0 (to reduce wrapping buffers) if empty
+    if (!buffer.empty())
+        start = size == 0 ? 0 : (start + bytes) % buffer.size(); // reset start to 0 (to reduce wrapping buffers) if empty
+    else if (size == 0) {
+        user_buffers.clear();
+        start = 0;
+    } else {
+        while (bytes) {
+            assert(!user_buffers.empty());
+            assert(start < user_buffers.front().second);
+            if (size_t remaining = user_buffers.front().second - start;
+                    bytes >= remaining) {
+                user_buffers.pop_front();
+                start = 0;
+                bytes -= remaining;
+            } else {
+                start += bytes;
+                bytes = 0;
+            }
+        }
+    }
+
     if (!unblocked_callbacks.empty())
         available_ready();
 }
 
-std::pair<bstring_view, bstring_view> Stream::pending() {
-    std::pair<bstring_view, bstring_view> bufs;
-    if (size_t rsize = unsent(); rsize > 0) {
+auto get_buffer_it(std::deque<std::pair<std::unique_ptr<const std::byte[]>, size_t>>& bufs, size_t offset) {
+    auto it = bufs.begin();
+    while (offset >= it->second) {
+        offset -= it->second;
+        it++;
+    }
+    return std::make_pair(std::move(it), offset);
+}
+
+std::vector<bstring_view> Stream::pending() {
+    std::vector<bstring_view> bufs;
+    size_t rsize = unsent();
+    if (!rsize) return bufs;
+    if (!buffer.empty()) {
         size_t rpos = (start + unacked_size) % buffer.size();
         if (size_t rend = rpos + rsize; rend <= buffer.size()) {
-            bufs.first = {buffer.data() + rpos, rsize};
+            bufs.emplace_back(buffer.data() + rpos, rsize);
         } else { // wrapping
-            bufs.first = {buffer.data() + rpos, buffer.size() - rpos};
-            bufs.second = {buffer.data(), rend % buffer.size()};
+            bufs.reserve(2);
+            bufs.emplace_back(buffer.data() + rpos, buffer.size() - rpos);
+            bufs.emplace_back(buffer.data(), rend % buffer.size());
         }
+    } else {
+        assert(!user_buffers.empty()); // If empty then unsent() should have been 0
+        auto [it, offset] = get_buffer_it(user_buffers, start + unacked_size);
+        bufs.reserve(std::distance(it, user_buffers.end()));
+        assert(it != user_buffers.end());
+        bufs.emplace_back(it->first.get() + offset, it->second - offset);
+        for (++it; it != user_buffers.end(); ++it)
+            bufs.emplace_back(it->first.get(), it->second);
     }
     return bufs;
 }
@@ -153,6 +204,10 @@ void Stream::when_available(unblocked_callback_t unblocked_cb) {
 }
 
 void Stream::handle_unblocked() {
+    if (buffer.empty()) {
+        while (!unblocked_callbacks.empty() && unblocked_callbacks.front()(*this))
+            unblocked_callbacks.pop();
+    }
     while (!unblocked_callbacks.empty() && available() > 0) {
         if (unblocked_callbacks.front()(*this))
             unblocked_callbacks.pop();
@@ -171,6 +226,7 @@ void Stream::wrote(size_t bytes) {
     //     [  áaarrrrrr  ]  or  [rr     áaar]
     // to:
     //     [  áaaaaarrr  ]  or  [aa     áaaa]
+    Debug("wrote ", bytes, ", unsent=",unsent());
     assert(bytes <= unsent());
     unacked_size += bytes;
 }

@@ -67,14 +67,17 @@ public:
 
     // Sets the size of the outgoing data buffer.  This may *only* be used if the buffer is
     // currently entirely empty; otherwise a runtime_error is thrown.  The minimum buffer size is
-    // 2048, the default is 64kiB.
+    // 2048, the default is 64kiB.  A value of 0 puts the Stream into user-provided buffer mode
+    // where only the version of `append` taking ownership of a char* is permitted.
     void set_buffer_size(size_t size);
 
-    // Returns the size of the buffer (including both pending and free space).
-    size_t buffer_size() const { return buffer.size(); }
+    // Returns the size of the buffer (including both pending and free space).  If using
+    // user-provided buffer mode then this is the sum of all held buffers.
+    size_t buffer_size() const;
 
-    // Returns the number of free bytes available in the outgoing stream data buffer
-    size_t available() const { return is_closing ? 0 : buffer.size() - size; }
+    // Returns the number of free bytes available in the outgoing stream data buffer. Always 0 in
+    // user-provided buffer mode.
+    size_t available() const { return is_closing || buffer.empty() ? 0 : buffer.size() - size; }
 
     // Returns the number of bytes currently referenced in the buffer (i.e. pending or
     // sent-but-unacknowledged).
@@ -103,6 +106,11 @@ public:
     size_t append_any(std::string_view data) {
         return append_any(bstring_view{reinterpret_cast<const std::byte*>(data.data()), data.size()});
     }
+
+    // Takes ownership of the given buffer pointer, queuing it to be sent after any existing buffers
+    // and freed once fully acked.  You *must* have called `set_buffer_size(0)` (or set the
+    // endpoints default_stream_buffer_size to 0) in order to use this.
+    void append_buffer(const std::byte* buf, size_t length);
 
     // Starting closing the stream and prevent any more outgoing data from being appended.  If
     // `error_code` is provided then we close immediately with the given code; if std::nullopt (the
@@ -142,6 +150,11 @@ public:
     // Available callbacks should only be used when the buffer is full, typically immediately after
     // an `append_any` call that returns less than the full write.  Similarly a false return from an
     // unblock function (which keeps the callback alive) should satisfy the same condition.
+    //
+    // In user-provided buffer mode the callback will be invoked after any data has been acked: it
+    // is up to the caller to look at used()/buffer_size()/etc. to decide what to do.  As described
+    // above, return true to remove this callback, false to keep it and try again after the next
+    // ack.
     void when_available(unblocked_callback_t unblocked_cb);
 
     // Calls io_ready() on the stream's connection to scheduling sending outbound data
@@ -188,12 +201,10 @@ private:
     // appending data).
     void acknowledge(size_t bytes);
 
-    // Returns a view into unwritten stream data.  This returns two string_views: if there is no
-    // pending data to write then both are empty; if the data to write does not wrap the buffer then
-    // .second will be empty and .first contains the data; if it wraps then both are non-empty and
-    // the .second buffer data immediately follows the .first buffer data.  After writing any of the
-    // provided data you should call `wrote()` to signal how much data you consumed.
-    std::pair<bstring_view, bstring_view> pending();
+    // Returns a view into unwritten stream data.  This returns a vector of string_views of the data
+    // to write, in order.  After writing any of the provided data you must call `wrote()` to signal
+    // how much of the given data was consumed (to advance the next pending() call).
+    std::vector<bstring_view> pending();
 
     // Called to signal that bytes have been written and should now be considered sent (but still
     // unacknowledged), thereby advancing the initial data position returned by the next `pending()`
@@ -205,10 +216,17 @@ private:
     StreamID stream_id{-1};
 
     // ring buffer of outgoing stream data that has not yet been acknowledged.  This cannot be
-    // resized once used as ngtcp2 will have pointers into the data.
+    // resized once used as ngtcp2 will have pointers into the data.  If this is empty then we are
+    // in user-provided buffer mode.
     std::vector<std::byte> buffer{65536};
 
+    // user-provided buffers; only used when `buffer` is empty (via a `set_buffer_size(0)` or a 0
+    // size given in the constructor).
+    std::deque<std::pair<std::unique_ptr<const std::byte[]>, size_t>> user_buffers;
+
     // Offset of the first used byte in the circular buffer, will always be in [0, buffer.size()).
+    // For user-provided buffers this is the starting offset in the currently sending user-provided
+    // buffer.
     size_t start{0};
 
     // Number of sent-but-unacked packets in the buffer (i.e. [start, start+unacked_size) are sent but
