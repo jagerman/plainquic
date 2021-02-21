@@ -10,6 +10,7 @@
 #include "log.h"
 #include "uvw/async.h"
 #include "uvw/poll.h"
+#include "uvw/timer.h"
 
 #include <oxenmq/hex.h>
 #include <oxenmq/bt_serialize.h>
@@ -91,7 +92,6 @@ namespace {
                 break;
 
             case NGTCP2_CRYPTO_LEVEL_HANDSHAKE:
-
                 if (!ngtcp2_conn_is_server(conn)) {
                     if (auto rv = conn.recv_transport_params(data); rv != 0)
                         return rv;
@@ -176,6 +176,7 @@ namespace {
             uint64_t offset, uint64_t datalen, void* user_data,
             void* stream_user_data) {
         Debug("######################", __func__);
+        Debug("Ack [", offset, ",", offset+datalen, ")");
         return static_cast<Connection*>(user_data)->stream_ack({stream_id}, datalen);
     }
 
@@ -198,13 +199,6 @@ namespace {
     int recv_retry(ngtcp2_conn* conn, const ngtcp2_pkt_hd* hd, void* user_data) {
         Debug("######################", __func__);
         Error("FIXME UNIMPLEMENTED ", __func__);
-        // FIXME
-        return 0;
-    }
-    int extend_max_local_streams_bidi(ngtcp2_conn* conn, uint64_t max_streams, void* user_data) {
-        Debug("######################", __func__);
-        Error("FIXME UNIMPLEMENTED ", __func__);
-        Warn("new max streams: ", max_streams);
         // FIXME
         return 0;
     }
@@ -311,6 +305,18 @@ io_result Connection::send() {
 std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks> Connection::init() {
     io_trigger = endpoint.loop->resource<uvw::AsyncHandle>();
     io_trigger->on<uvw::AsyncEvent>([this] (auto&, auto&) { on_io_ready(); });
+
+    retransmit_timer = endpoint.loop->resource<uvw::TimerHandle>();
+    retransmit_timer->on<uvw::TimerEvent>([this] (auto&, auto&) {
+        Debug("Retransmit timer fired!");
+        if (auto rv = ngtcp2_conn_handle_expiry(*this, get_timestamp()); rv != 0) {
+            Warn("expiry handler invocation returned an error: ", ngtcp2_strerror(rv));
+            endpoint.close_connection(*this, ngtcp2_err_infer_quic_transport_error_code(rv), false);
+        } else {
+            flush_streams();
+        }
+    });
+    retransmit_timer->start(0ms, 0ms);
 
     auto result = std::tuple<ngtcp2_settings, ngtcp2_transport_params, ngtcp2_callbacks>{};
     auto& [settings, tparams, cb] = result;
@@ -422,7 +428,6 @@ Connection::Connection(Client& c, const ConnectionID& scid, const Path& path, ui
 
     cb.client_initial = client_initial;
     cb.recv_retry = recv_retry;
-    cb.extend_max_local_streams_bidi = extend_max_local_streams_bidi;
     //cb.extend_max_local_streams_bidi = extend_max_local_streams_bidi;
     //cb.recv_new_token = recv_new_token;
 
@@ -452,11 +457,6 @@ void Connection::on_io_ready() {
     Debug(__func__);
     flush_streams();
     Debug("done ", __func__);
-}
-
-void Connection::on_read(bstring_view data) {
-    Debug("FIXME UNIMPLEMENTED ", __func__, ", data size: ", data.size());
-    // FIXME
 }
 
 void Connection::flush_streams() {
@@ -491,12 +491,9 @@ void Connection::flush_streams() {
 
         // FIXME: update remote addr? ecn?
         auto sent = send();
-        if (sent.blocked()) {
-            // FIXME: somewhere (maybe here?) should be setting up a write poll so that, once
-            // writing becomes available again (and the pending packet gets sent), we get back here.
-            // FIXME 2: I think this is already done by send() itself.
-            return false;
-        }
+        if (sent.blocked())
+            return false; // We'll get called again when the socket becomes writable
+
         send_buffer_size = 0;
         if (!sent) {
             Warn("I/O error while trying to send packet: ", sent.str());
@@ -562,6 +559,7 @@ void Connection::flush_streams() {
             switch (nwrite) {
                 case 0:
                     Debug("Done stream writing to ", stream.id(), " (either stream is congested or we have nothing else to send right now)");
+                    assert(consumed <= 0);
                     break;
                 case NGTCP2_ERR_WRITE_MORE:
                     Debug("consumed ", consumed, " bytes from stream ", stream.id(), " and have space left");
@@ -587,8 +585,8 @@ void Connection::flush_streams() {
         }
     }
 
-    // Now try more with stream id -1 and no data: this will take care of initial handshake packets,
-    // and should finish off any partially-filled packet from above.
+    // Now try more with stream id -1 and no data: this takes care of things like initial handshake
+    // packets, and also finishes off any partially-filled packet from above.
     for (;;) {
         auto [nwrite, consumed] = add_stream_data(StreamID{}, nullptr, 0);
         Debug("add_stream_data for non-stream returned [", nwrite, ",", consumed, "]");
@@ -598,18 +596,39 @@ void Connection::flush_streams() {
             continue;
         } else if (nwrite < 0) {
             Warn("Error writing non-stream data: ", ngtcp2_strerror(nwrite));
-            return;
+            break;
         } else if (nwrite == 0) {
 
             // FIXME: Check whether this is actually possible for the -1 streamid?
-            Warn("Unable to continue non-stream writing: we are congested");
-            return;
+            Debug("Nothing else to write for non-stream data for now (or we are congested)");
+            ngtcp2_conn_stat cstat;
+            ngtcp2_conn_get_conn_stat(*this, &cstat);
+            Debug("Current unacked bytes in flight: ", cstat.bytes_in_flight);
+            break;
         }
 
         Debug("Sending non-stream data packet");
         if (!send_packet(nwrite))
             return;
     }
+
+    schedule_retransmit();
+}
+
+void Connection::schedule_retransmit() {
+    auto expiry = std::chrono::nanoseconds{ngtcp2_conn_get_expiry(*this)};
+    Debug("SCHEDULE RETRANSMIT exp ", expiry.count());
+    if (expiry < 0ns) {
+        retransmit_timer->repeat(0ms);
+        return;
+    }
+    auto expires_in = std::chrono::duration_cast<std::chrono::milliseconds>(
+         expiry - get_time().time_since_epoch());
+    Debug("Next retransmit in ", expires_in.count(), "ms");
+    if (expires_in < 1ms)
+        expires_in = 1ms;
+    retransmit_timer->repeat(expires_in);
+    retransmit_timer->again();
 }
 
 int Connection::stream_opened(StreamID id) {
@@ -638,7 +657,7 @@ int Connection::stream_opened(StreamID id) {
     return 0;
 }
 
-int Connection::stream_receive(StreamID id, bstring_view data, bool fin) {
+int Connection::stream_receive(StreamID id, const bstring_view data, bool fin) {
     auto str = get_stream(id);
     if (!str->data_callback)
         Debug("Dropping incoming data on stream ", str->id(), ": stream has no data callback set");
@@ -662,6 +681,9 @@ int Connection::stream_receive(StreamID id, bstring_view data, bool fin) {
             str->close_callback(*str, std::nullopt);
         streams.erase(id);
         io_ready();
+    } else {
+        ngtcp2_conn_extend_max_stream_offset(*this, id.id, data.size());
+        ngtcp2_conn_extend_max_offset(*this, data.size());
     }
     return 0;
 }

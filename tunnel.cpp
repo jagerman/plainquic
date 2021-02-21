@@ -6,7 +6,6 @@ namespace tunnel {
 
 // Takes data from the tcp connection and pushes it down the quic tunnel
 void on_outgoing_data(uvw::DataEvent& event, uvw::TCPHandle& client) {
-    quic::Warn("on outgoing data");
     auto stream = client.data<quic::Stream>();
     assert(stream);
     std::string_view data{event.data.get(), event.length};
@@ -44,7 +43,6 @@ void on_outgoing_data(uvw::DataEvent& event, uvw::TCPHandle& client) {
 
 // Received data from the quic tunnel and sends it to the TCP connection
 void on_incoming_data(quic::Stream& stream, quic::bstring_view bdata) {
-    quic::Error("on incoming data");
     auto tcp = stream.data<uvw::TCPHandle>();
     assert(tcp);
     std::string_view data{reinterpret_cast<const char*>(bdata.data()), bdata.size()};

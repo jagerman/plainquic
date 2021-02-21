@@ -42,12 +42,12 @@ protected:
     std::shared_ptr<uvw::Loop> loop;
 
     // How many messages (at most) we recv per callback:
-    static constexpr size_t N_msgs = 8;
+    static constexpr int N_msgs = 8;
 #ifdef LOKINET_HAVE_RECVMMSG
-    static constexpr size_t N_mmsg = N_msgs;
+    static constexpr int N_mmsg = N_msgs;
     std::array<mmsghdr, N_mmsg> msgs;
 #else
-    static constexpr size_t N_mmsg = 1;
+    static constexpr int N_mmsg = 1;
     std::array<msghdr, N_mmsg> msgs;
 #endif
 
@@ -206,6 +206,7 @@ public:
     // Default stream buffer size for streams opened through this endpoint.
     size_t default_stream_buffer_size = 64*1024;
 
+    // Gets a reference to the UV event loop
     uvw::Loop& get_loop() { return *loop; }
 };
 

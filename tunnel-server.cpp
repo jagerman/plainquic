@@ -1,11 +1,11 @@
 #include "connection.h"
 #include "server.h"
 #include "log.h"
-
 #include "tunnel.h"
-#include "uvw/tcp.h"
 
-#include <uvw.hpp>
+#include <set>
+
+#include <uvw/tcp.h>
 
 using namespace std::literals;
 
@@ -16,7 +16,7 @@ int usage(std::string_view arg0, std::string_view msg) {
 
 int main(int argc, char *argv[]) {
     uint16_t listen_port = 4242;
-    std::unordered_set<uint16_t> allowed_ports{{22, 80, 4444, 8080}};
+    std::set<uint16_t> allowed_ports{{22, 80, 4444, 8080}};
 
     if (argc >= 2 && !tunnel::parse_int(argv[1], listen_port))
         return usage(argv[0], "Invalid port "s + argv[1]);
@@ -101,6 +101,12 @@ int main(int argc, char *argv[]) {
         }
     };
     quic::Debug("Initialized server");
+    std::cout << "Listening on localhost:" << listen_port << " with tunnel(s) to localhost port(s):";
+    if (allowed_ports.empty())
+        std::cout << " (any)";
+    for (auto p : allowed_ports)
+        std::cout << ' ' << p;
+    std::cout << '\n';
 
     loop->run();
 

@@ -16,6 +16,7 @@
 #include <ngtcp2/ngtcp2.h>
 #include <uvw/async.h>
 #include <uvw/poll.h>
+#include <uvw/timer.h>
 
 namespace quic {
 
@@ -108,6 +109,10 @@ private:
     // Event trigger used to queue packet processing for this connection
     std::shared_ptr<uvw::AsyncHandle> io_trigger;
 
+    // Schedules a retransmit in the event loop (according to when ngtcp2 tells us we should)
+    void schedule_retransmit();
+    std::shared_ptr<uvw::TimerHandle> retransmit_timer;
+
     // The port the client wants to connect to on the server
     uint16_t tunnel_port = 0;
 
@@ -184,7 +189,6 @@ public:
     // Called (via libuv) when it wants us to do our stuff. Call io_ready() to schedule this.
     void on_io_ready();
 
-    void on_read(bstring_view data);
     int setup_server_crypto_initial();
 
     // Flush any streams with pending data. Note that, depending on available ngtcp2 state, we may
@@ -226,6 +230,7 @@ public:
     // Accesses the stream via its StreamID; throws std::out_of_range if the stream doesn't exist.
     const std::shared_ptr<Stream>& get_stream(StreamID s) const;
 
+    // Internal methods that need to be publicly callable because we call them from C functions:
     int init_client();
     int recv_initial_crypto(std::basic_string_view<uint8_t> data);
     int recv_transport_params(std::basic_string_view<uint8_t> data);
